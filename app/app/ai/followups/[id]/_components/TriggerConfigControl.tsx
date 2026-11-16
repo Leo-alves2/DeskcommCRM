@@ -22,15 +22,26 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useUpdateTriggerConfig } from "@/hooks/followup/useFollowupFlow";
 import { etapasPorFunil, nomeDaEtapa, useEtapasDeGatilho } from "@/hooks/followup/useEtapasDeGatilho";
+import {
+  DEFAULT_THRESHOLD_MINUTES as DEFAULT_RETORNO_MINUTES,
+  UNIDADES_DE_LIMIAR,
+  limiarDaTela,
+  limiarValido,
+  minutosDoLimiar,
+  type UnidadeDeLimiar,
+} from "@/lib/followup/gap-de-retorno";
+import { MAX_PAUSA_DE_REENTRADA_MINUTES } from "@/lib/followup/pausa-de-reentrada";
+import { normalizarTag } from "@/lib/contacts/tag-normalizada";
 
 /**
  * Controle de `trigger_config` do pointer (Task 8.5) — como o fluxo começa.
  *
  * ⚠️ SÓ APARECE AQUI O QUE TEM MOTOR VIVO, e essa disciplina é a razão de o
- * controle ser confiável: `manual` (POST manual), `silence` (silence-sweep) e
- * `stage_change` (`lib/followup/gatilho-etapa.ts`, consumidor de
- * `lead.stage_changed` no `event_log`). `conversation_end` continua no schema
- * sem produtor — não é oferecido, e o publish o recusa se chegar por API crua.
+ * controle ser confiável: `manual` (POST manual), `silence` (silence-sweep),
+ * `stage_change` (`lib/followup/gatilho-etapa.ts`), `inbound_after_silence`
+ * (`lib/followup/gatilho-retorno.ts`) e os demais kinds com produtor.
+ * `conversation_end` continua no schema sem produtor — não é oferecido, e o
+ * publish o recusa se chegar por API crua.
  * Dado antigo com um kind que não sabemos armar é mostrado como
  * «(indisponível)» em vez de mentir «Manual».
  *
@@ -54,19 +65,74 @@ import { etapasPorFunil, nomeDaEtapa, useEtapasDeGatilho } from "@/hooks/followu
  * «poucos minutos», não «na hora» — prometer instantâneo seria o controle
  * mentindo sobre a própria função.
  */
-type TriggerKind = "appointment_no_show" | "manual" | "silence" | "stage_change" | "case_opened" | "webhook";
+type TriggerKind =
+  | "appointment_no_show"
+  | "manual"
+  | "silence"
+  | "stage_change"
+  | "case_opened"
+  | "webhook"
+  | "inbound_after_silence"
+  | "lead_created";
 
 interface TriggerFormState {
   kind: TriggerKind;
   thresholdMinutes: number;
+  thresholdValor: number;
+  thresholdUnidade: UnidadeDeLimiar;
   segments: string;
+  /** Pausa de reentrada do gatilho de silêncio, em HORAS na tela; o fio guarda minutos. */
+  reentryPauseHours: number;
+  /** Quantas vezes o fluxo pode recomeçar para o mesmo contato; 0 = sem teto. */
+  maxEnrollments: number;
+  /** Exige que a equipe tenha respondido a última mensagem do cliente. */
+  exigeResposta: boolean;
+  /** Teto do silêncio, em minutos; 0 = sem teto. */
+  maxSilenceMinutes: number;
+  /** A pausa conta do último ENVIO deste fluxo (e não da última mensagem do cliente). */
+  pauseFromLastSend: boolean;
   stageId: string;
   cancelOnReply: boolean;
+  /**
+   * #3974 — "quando o cliente responder, mover o card para a etapa X". Vazio =
+   * não move. Só existe no gatilho de ETAPA: é o único que sabe qual card armou.
+   */
+  moveToStageId: string;
   eventTypeIds: string[];
+  /**
+   * #4587 — o filtro do gatilho «Lead criado»: o funil em que o card precisa
+   * nascer e a etiqueta que ele precisa ter. Vazio = qualquer.
+   *
+   * Por que existir: só há UM fluxo vivo por contato
+   * (`idx_followup_enrollments_one_live`). Sem filtro, o card nascido no funil B
+   * inscrevia o contato no fluxo do funil A e, por ser a única inscrição
+   * permitida, bloqueava a do fluxo certo.
+   */
+  pipelineId: string;
+  tagDoNegocio: string;
 }
 
 const DEFAULT_THRESHOLD_MINUTES = 60;
 const MIN_THRESHOLD_MINUTES = 5;
+const MAX_PAUSA_HORAS = MAX_PAUSA_DE_REENTRADA_MINUTES / 60;
+/** O mesmo teto do mínimo no contrato (7 dias). */
+const MAX_SILENCIO_MINUTOS = 10_080;
+
+/**
+ * O "não mover" do seletor de etapa do #3974.
+ *
+ * O Radix `Select` não aceita item com valor vazio, então o "nenhuma etapa" tem
+ * um valor próprio e a conversão para `""` (ausente no `trigger_config`) mora no
+ * `onValueChange` e no `toTriggerConfig`.
+ */
+const NAO_MOVER = "nao_mover";
+
+/**
+ * O "qualquer funil" do filtro do gatilho de card (#4587). O Radix não aceita
+ * item com valor vazio; a conversão para `""` (ausente no `trigger_config`) mora
+ * no `onValueChange` e no `toTriggerConfig`.
+ */
+const QUALQUER_FUNIL = "qualquer_funil";
 
 const KIND_LABEL: Record<TriggerKind, string> = {
   appointment_no_show:"Falta confirmada pela equipe",
@@ -81,6 +147,8 @@ const KIND_LABEL: Record<TriggerKind, string> = {
   // cercam o gatilho procuram por ela com `exact: true`.
   case_opened: "Agente pediu ajuda",
   webhook: "Automação (Webhooks)",
+  inbound_after_silence: "Cliente voltou",
+  lead_created: "Lead criado",
 };
 
 function parseTriggerConfig(raw: Record<string, unknown>): TriggerFormState {
@@ -91,17 +159,40 @@ function parseTriggerConfig(raw: Record<string, unknown>): TriggerFormState {
   // botão de cancelar-na-resposta. Agora só os kinds que este painel sabe EDITAR
   // caem no formulário; o resto é preservado (ver `open` no componente).
   const kind: TriggerKind =
-    raw.kind === "appointment_no_show" ? "appointment_no_show" : raw.kind === "silence"
-      ? "silence"
-      : raw.kind === "stage_change"
-        ? "stage_change"
-        : raw.kind === "case_opened"
-          ? "case_opened"
-          : raw.kind === "webhook"
-            ? "webhook"
-            : "manual";
+    raw.kind === "appointment_no_show"
+      ? "appointment_no_show"
+      : raw.kind === "silence"
+        ? "silence"
+        : raw.kind === "inbound_after_silence"
+          ? "inbound_after_silence"
+          : raw.kind === "stage_change"
+            ? "stage_change"
+            : raw.kind === "case_opened"
+              ? "case_opened"
+              : raw.kind === "webhook"
+                ? "webhook"
+                : raw.kind === "lead_created"
+                  ? "lead_created"
+                  : "manual";
   const params =
-    (raw.params as { threshold_minutes?: number; segments?: string[]; stage_id?: string; event_type_ids?: string[] } | undefined) ?? {};
+    (raw.params as {
+      threshold_minutes?: number;
+      segments?: string[];
+      stage_id?: string;
+      pipeline_id?: string;
+      tag?: string;
+      event_type_ids?: string[];
+      reentry_pause_minutes?: number;
+      max_silence_minutes?: number;
+      reentry_pause_basis?: string;
+      max_enrollments_por_contato?: number;
+      exige_resposta_da_equipe?: boolean;
+    } | undefined) ?? {};
+  const minutosRetorno =
+    kind === "inbound_after_silence" && typeof params.threshold_minutes === "number"
+      ? params.threshold_minutes
+      : DEFAULT_RETORNO_MINUTES;
+  const tela = limiarDaTela(minutosRetorno);
   return {
     kind,
     eventTypeIds: Array.isArray(params.event_type_ids) ? params.event_type_ids : [],
@@ -109,33 +200,109 @@ function parseTriggerConfig(raw: Record<string, unknown>): TriggerFormState {
       kind === "silence" && typeof params.threshold_minutes === "number"
         ? params.threshold_minutes
         : DEFAULT_THRESHOLD_MINUTES,
-    segments: kind === "silence" && Array.isArray(params.segments) ? params.segments.join(", ") : "",
+    thresholdValor: tela.valor,
+    thresholdUnidade: tela.unidade,
+    segments:
+      (kind === "silence" || kind === "inbound_after_silence") && Array.isArray(params.segments)
+        ? params.segments.join(", ")
+        : "",
+    reentryPauseHours:
+      kind === "silence" && typeof params.reentry_pause_minutes === "number" ? params.reentry_pause_minutes / 60 : 0,
+    maxSilenceMinutes:
+      kind === "silence" && typeof params.max_silence_minutes === "number" ? params.max_silence_minutes : 0,
+    pauseFromLastSend: kind === "silence" && params.reentry_pause_basis === "ultimo_envio",
+    maxEnrollments:
+      kind === "silence" && typeof params.max_enrollments_por_contato === "number"
+        ? params.max_enrollments_por_contato
+        : 0,
+    exigeResposta: kind === "silence" && params.exige_resposta_da_equipe === true,
     stageId: kind === "stage_change" && typeof params.stage_id === "string" ? params.stage_id : "",
     cancelOnReply: raw.cancel_on_reply === true,
+    moveToStageId:
+      kind === "stage_change" && typeof raw.move_to_stage_on_reply === "string" ? raw.move_to_stage_on_reply : "",
+    pipelineId: kind === "lead_created" && typeof params.pipeline_id === "string" ? params.pipeline_id : "",
+    tagDoNegocio: kind === "lead_created" && typeof params.tag === "string" ? params.tag : "",
   };
 }
 
 function toTriggerConfig(form: TriggerFormState): Record<string, unknown> {
   const cancelOnReply = form.cancelOnReply ? { cancel_on_reply: true } : {};
-  if (form.kind === "appointment_no_show") return {kind:"appointment_no_show",params:{event_type_ids:form.eventTypeIds}};
+  // ⚠️ ESTE TIPO GRAVA O INTERRUPTOR LIGADO, SEMPRE. A tela o mostra ligado
+  // (e travado) porque neste gatilho não há escolha a fazer — quem marca a
+  // consulta é o atendimento, e a sequência de falta só existe para o silêncio
+  // de quem não compareceu (`lib/followup/modelos/clinica.ts`). Faltava a outra
+  // metade: o valor visível não entrava no `trigger_config`, e para o motor
+  // (`cancel_on_reply ?? false`) o fluxo seguia disparando por cima do paciente
+  // que respondeu «quero remarcar» — issue #3400. O `true` é LITERAL e não
+  // `form.cancelOnReply` de propósito: trocar o tipo para este gatilho dentro do
+  // painel não mexe no interruptor, e a verdade gravada é a constante da tela.
+  if (form.kind === "appointment_no_show") return {kind:"appointment_no_show",params:{event_type_ids:form.eventTypeIds},cancel_on_reply:true};
   if (form.kind === "manual") return { kind: "manual", ...cancelOnReply };
 
   if (form.kind === "stage_change") {
-    return { kind: "stage_change", params: { stage_id: form.stageId }, ...cancelOnReply };
+    return {
+      kind: "stage_change",
+      params: { stage_id: form.stageId },
+      ...cancelOnReply,
+      // #3974: a opção irmã de "cancelar ao responder". Vazia, a chave NEM
+      // VIAJA — o motor lê o ausente como "não move", e um `""` gravado
+      // reprovaria o uuid do schema e derrubaria o publish inteiro.
+      ...(form.moveToStageId ? { move_to_stage_on_reply: form.moveToStageId } : {}),
+    };
   }
 
   // Sem `params`: não há o que casar. Todo caso aberto da organização dispara
   // todo fluxo armado assim.
   if (form.kind === "case_opened") return { kind: "case_opened", ...cancelOnReply };
   if (form.kind === "webhook") return { kind: "webhook", ...cancelOnReply };
+  if (form.kind === "lead_created") {
+    // #4587 — o filtro do card. Vazio NÃO vira `params: {}`: sem filtro o
+    // `trigger_config` é o de antes desta mudança, byte a byte (fluxo já
+    // publicado não muda de sentido por ter sido salvo de novo).
+    const pipelineId = form.pipelineId.trim();
+    const tag = form.tagDoNegocio.trim();
+    const filtro = {
+      ...(pipelineId ? { pipeline_id: pipelineId } : {}),
+      ...(tag ? { tag: normalizarTag(tag) } : {}),
+    };
+    return {
+      kind: "lead_created",
+      ...(Object.keys(filtro).length > 0 ? { params: filtro } : {}),
+      ...cancelOnReply,
+    };
+  }
 
   const segments = form.segments
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+
+  if (form.kind === "inbound_after_silence") {
+    const minutes = minutosDoLimiar(form.thresholdValor, form.thresholdUnidade);
+    return {
+      kind: "inbound_after_silence",
+      params: {
+        threshold_minutes: Number.isFinite(minutes) ? minutes : DEFAULT_RETORNO_MINUTES,
+        ...(segments.length > 0 ? { segments } : {}),
+      },
+      ...cancelOnReply,
+    };
+  }
+
+  const pausa = Math.round(form.reentryPauseHours * 60);
   return {
     kind: "silence",
-    params: { threshold_minutes: form.thresholdMinutes, ...(segments.length > 0 ? { segments } : {}) },
+    params: {
+      threshold_minutes: form.thresholdMinutes,
+      ...(segments.length > 0 ? { segments } : {}),
+      ...(pausa > 0 ? { reentry_pause_minutes: pausa } : {}),
+      ...(pausa > 0 && form.pauseFromLastSend ? { reentry_pause_basis: "ultimo_envio" } : {}),
+      ...(form.maxSilenceMinutes > 0 ? { max_silence_minutes: Math.round(form.maxSilenceMinutes) } : {}),
+      ...(form.maxEnrollments > 0
+        ? { max_enrollments_por_contato: Math.round(form.maxEnrollments) }
+        : {}),
+      ...(form.exigeResposta ? { exige_resposta_da_equipe: true } : {}),
+    },
     ...cancelOnReply,
   };
 }
@@ -144,25 +311,73 @@ function summaryLabel(
   cfg: Record<string, unknown>,
   etapa: { stageName: string; pipelineName: string } | null,
   t: (texto: string) => string = (texto) => texto,
+  /** Nome do funil do filtro do gatilho de card (#4587); null = não resolvido. */
+  funilDoFiltro: string | null = null,
 ): string {
   if(cfg.kind === "appointment_no_show") return t("Gatilho: falta confirmada pela equipe");
   if (cfg.kind === "silence") {
+    const params = cfg.params as
+      | { threshold_minutes?: number; reentry_pause_minutes?: number; max_silence_minutes?: number; reentry_pause_basis?: string }
+      | undefined;
+    const minutes = params?.threshold_minutes;
+    const pausa = params?.reentry_pause_minutes;
+    const teto = params?.max_silence_minutes;
+    const detalhe = [
+      typeof minutes === "number" ? (typeof teto === "number" && teto > 0 ? `${minutes}–${teto} min` : `${minutes} min`) : null,
+      typeof pausa === "number" && pausa > 0
+        ? params?.reentry_pause_basis === "ultimo_envio"
+          ? `${t("no máximo 1× a cada")} ${Math.round((pausa / 60) * 10) / 10} h`
+          : `${t("pausa de")} ${Math.round((pausa / 60) * 10) / 10} h`
+        : null,
+    ].filter(Boolean);
+    return `${t("Gatilho")}: ${t("Silêncio")}${detalhe.length > 0 ? ` (${detalhe.join(" · ")})` : ""}`;
+  }
+  if (cfg.kind === "inbound_after_silence") {
     const minutes = (cfg.params as { threshold_minutes?: number } | undefined)?.threshold_minutes;
-    return `Gatilho: Silêncio${typeof minutes === "number" ? ` (${minutes} min)` : ""}`;
+    const tela = limiarDaTela(typeof minutes === "number" ? minutes : DEFAULT_RETORNO_MINUTES);
+    const unidade =
+      tela.unidade === "days"
+        ? tela.valor === 1
+          ? t("dia")
+          : t("dias")
+        : tela.unidade === "hours"
+          ? tela.valor === 1
+            ? t("hora")
+            : t("horas")
+          : tela.valor === 1
+            ? t("minuto")
+            : t("minutos");
+    return `${t("Gatilho")}: ${t("Cliente voltou")} (${tela.valor} ${unidade})`;
   }
   if (cfg.kind === "stage_change") {
     // Enquanto os nomes não chegaram (ou a etapa sumiu do funil) o rótulo diz o
     // TIPO em vez de vazar o uuid — que é justamente o que esta tela não faz.
     // Com o funil junto, este rótulo passa a distinguir as homônimas: é a única
     // superfície que o dono lê uma semana depois, sem abrir nada.
-    return etapa ? `Gatilho: entrou em «${etapa.stageName}» em ${etapa.pipelineName}` : "Gatilho: Etapa do funil";
+    return etapa
+      ? `${t("Gatilho")}: ${t("entrou em")} «${etapa.stageName}» ${t("em")} ${etapa.pipelineName}`
+      : `${t("Gatilho")}: ${t("Etapa do funil")}`;
   }
   if (cfg.kind === "case_opened") return `${t("Gatilho")}: ${t("quando o agente pede ajuda")}`;
   if (cfg.kind === "webhook") return t("Disparado por uma automação em Webhooks");
+  // #4587 — o rótulo diz o que está escolhido: um fluxo «Lead criado» com
+  // filtro e um sem filtro fazem coisas diferentes, e é o botão fechado que o
+  // dono lê uma semana depois.
+  if (cfg.kind === "lead_created") {
+    const p = cfg.params as { pipeline_id?: string; tag?: string } | undefined;
+    const partes: string[] = [];
+    if (typeof p?.pipeline_id === "string" && p.pipeline_id) {
+      partes.push(`${t("no funil")} «${funilDoFiltro ?? t("escolhido")}»`);
+    }
+    if (typeof p?.tag === "string" && p.tag) partes.push(`${t("com a etiqueta")} «${p.tag}»`);
+    return partes.length > 0
+      ? `${t("Gatilho")}: ${t("Lead criado")} (${partes.join(" · ")})`
+      : `${t("Gatilho")}: ${t("Lead criado")}`;
+  }
   if (cfg.kind === "manual" || cfg.kind === undefined) return `${t("Gatilho")}: ${t("Manual")}`;
   // conversation_end de dados antigos (API crua) — sem UI própria, mas mostrado
   // com transparência em vez de mentir "Manual".
-  return `Gatilho: ${String(cfg.kind)} (indisponível)`;
+  return `${t("Gatilho")}: ${String(cfg.kind)} (${t("indisponível")})`;
 }
 
 interface Props {
@@ -182,7 +397,12 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
   // precisa do nome da etapa para não exibir «Etapa do funil» genérico num
   // fluxo já configurado.
   const { etapas, carregando: etapasCarregando } = useEtapasDeGatilho();
-  const etapaSalva = etapas.find((e) => e.stageId === parseTriggerConfig(triggerConfig).stageId);
+  const salvoNoFio = parseTriggerConfig(triggerConfig);
+  const etapaSalva = etapas.find((e) => e.stageId === salvoNoFio.stageId);
+  // #4587 — o nome do funil do filtro, para o botão fechado dizer QUAL funil.
+  const funilDoFiltro = salvoNoFio.pipelineId
+    ? (etapas.find((e) => e.pipelineId === salvoNoFio.pipelineId)?.pipelineName ?? null)
+    : null;
 
   // Re-sincroniza com o valor persistido quando o popover está FECHADO — nunca
   // no meio de uma edição em andamento (mesma doutrina do `savedGraph` do canvas).
@@ -193,8 +413,24 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
     setForm(next);
   }, [triggerConfig, open]);
 
+  const minutosRetorno = minutosDoLimiar(form.thresholdValor, form.thresholdUnidade);
+  const retornoInvalid =
+    form.kind === "inbound_after_silence" && !limiarValido(minutosRetorno);
+  const pausaInvalid =
+    form.kind === "silence" &&
+    (!Number.isFinite(form.reentryPauseHours) || form.reentryPauseHours < 0 || form.reentryPauseHours > MAX_PAUSA_HORAS);
+  const tetoInvalid =
+    form.kind === "silence" &&
+    form.maxSilenceMinutes !== 0 &&
+    (!Number.isFinite(form.maxSilenceMinutes) ||
+      form.maxSilenceMinutes <= form.thresholdMinutes ||
+      form.maxSilenceMinutes > MAX_SILENCIO_MINUTOS);
   const thresholdInvalid =
-    form.kind === "silence" && (!Number.isFinite(form.thresholdMinutes) || form.thresholdMinutes < MIN_THRESHOLD_MINUTES);
+    (form.kind === "silence" &&
+      (!Number.isFinite(form.thresholdMinutes) || form.thresholdMinutes < MIN_THRESHOLD_MINUTES)) ||
+    retornoInvalid ||
+    pausaInvalid ||
+    tetoInvalid;
   // Gatilho de etapa sem etapa escolhida não é rascunho: é um fluxo que ficaria
   // ativo sem nunca disparar. O publish recusa; o Salvar recusa antes.
   const stageInvalid = form.kind === "stage_change" && form.stageId.trim().length === 0;
@@ -202,8 +438,22 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
     form.kind !== saved.kind ||
     (form.kind === "appointment_no_show" && form.eventTypeIds.join() !== saved.eventTypeIds.join()) ||
     form.cancelOnReply !== saved.cancelOnReply ||
-    (form.kind === "silence" && (form.thresholdMinutes !== saved.thresholdMinutes || form.segments !== saved.segments)) ||
-    (form.kind === "stage_change" && form.stageId !== saved.stageId);
+    (form.kind === "silence" &&
+      (form.thresholdMinutes !== saved.thresholdMinutes ||
+        form.segments !== saved.segments ||
+        form.reentryPauseHours !== saved.reentryPauseHours ||
+        form.maxSilenceMinutes !== saved.maxSilenceMinutes ||
+        form.maxEnrollments !== saved.maxEnrollments ||
+        form.exigeResposta !== saved.exigeResposta ||
+        form.pauseFromLastSend !== saved.pauseFromLastSend)) ||
+    (form.kind === "inbound_after_silence" &&
+      (form.thresholdValor !== saved.thresholdValor ||
+        form.thresholdUnidade !== saved.thresholdUnidade ||
+        form.segments !== saved.segments)) ||
+    (form.kind === "stage_change" && form.stageId !== saved.stageId) ||
+    (form.kind === "stage_change" && form.moveToStageId !== saved.moveToStageId) ||
+    (form.kind === "lead_created" &&
+      (form.pipelineId !== saved.pipelineId || form.tagDoNegocio !== saved.tagDoNegocio));
 
   const onSave = () => {
     if (thresholdInvalid || stageInvalid) return;
@@ -219,18 +469,44 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
   // para serem distinguíveis.
   const funis = etapasPorFunil(etapas);
 
+  // A etapa de destino do "mover ao responder" (#3974) vive no MESMO funil da
+  // etapa que dispara: mover entre funis é recusado pelo escritor de etapa
+  // (`pipeline_immutable_use_clone`), e oferecer na tela o que o motor vai
+  // recusar seria a tela prometendo o que não faz.
+  const funilDoGatilho = etapas.find((e) => e.stageId === form.stageId)?.pipelineId ?? null;
+  const etapasDoFunilDoGatilho = funilDoGatilho ? etapas.filter((e) => e.pipelineId === funilDoGatilho) : [];
+
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button type="button" variant="outline" size="sm" data-testid="trigger-config-button">
-          {summaryLabel(triggerConfig, etapaSalva ?? null, t)}
+          {summaryLabel(triggerConfig, etapaSalva ?? null, t, funilDoFiltro)}
         </Button>
       </PopoverTrigger>
-      <PopoverContent className="w-80" align="end" data-testid="trigger-config-panel">
+      {/* O painel cresce com o gatilho de silêncio (mínimo, teto, segmentos, pausa):
+          numa tela de 720 px o «Salvar gatilho» ficava abaixo da dobra, sem rolagem.
+          Mesma régua do `SelectContent` (altura disponível do Radix + rolagem). */}
+      <PopoverContent
+        className="w-80 max-h-(--radix-popover-content-available-height) overflow-y-auto"
+        align="end"
+        data-testid="trigger-config-panel"
+      >
         <div className="space-y-3">
           <div className="space-y-2">
             <Label htmlFor="trigger-kind">{t("Tipo de gatilho")}</Label>
-            <Select value={form.kind} onValueChange={(v) => setForm((f) => ({ ...f, kind: v as TriggerKind }))}>
+            <Select
+              value={form.kind}
+              onValueChange={(v) =>
+                setForm((f) => {
+                  const kind = v as TriggerKind;
+                  if (kind === "inbound_after_silence" && f.kind !== "inbound_after_silence") {
+                    const tela = limiarDaTela(DEFAULT_RETORNO_MINUTES);
+                    return { ...f, kind, thresholdValor: tela.valor, thresholdUnidade: tela.unidade };
+                  }
+                  return { ...f, kind };
+                })
+              }
+            >
               <SelectTrigger id="trigger-kind">
                 <SelectValue />
               </SelectTrigger>
@@ -240,6 +516,8 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
                 <SelectItem value="stage_change">{t(KIND_LABEL.stage_change)}</SelectItem>
                 <SelectItem value="appointment_no_show">{t(KIND_LABEL.appointment_no_show)}</SelectItem>
                 <SelectItem value="case_opened">{t(KIND_LABEL.case_opened)}</SelectItem>
+                <SelectItem value="inbound_after_silence">{t(KIND_LABEL.inbound_after_silence)}</SelectItem>
+                <SelectItem value="lead_created">{t(KIND_LABEL.lead_created)}</SelectItem>
                 <SelectItem value="webhook">{t(KIND_LABEL.webhook)}</SelectItem>
               </SelectContent>
             </Select>
@@ -254,7 +532,7 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
                 disabled={etapasCarregando || etapas.length === 0}
               >
                 <SelectTrigger id="trigger-stage" data-testid="trigger-stage-select" aria-invalid={stageInvalid}>
-                  <SelectValue placeholder={etapasCarregando ? "Carregando etapas…" : "Escolha a etapa"} />
+                  <SelectValue placeholder={etapasCarregando ? t("Carregando etapas…") : t("Escolha a etapa")} />
                 </SelectTrigger>
                 <SelectContent>
                   {funis.map((funil) => (
@@ -309,12 +587,128 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
             </div>
           )}
 
+          {form.kind === "lead_created" && (
+            <div className="space-y-2">
+              {/* #4587 — o filtro do card. Sem ele, o card nascido em outro
+                  funil inscrevia o contato neste fluxo e, por só existir um
+                  fluxo vivo por contato, bloqueava o fluxo do funil certo. */}
+              <div className="space-y-2">
+                <Label htmlFor="trigger-lead-pipeline">{t("Funil (opcional)")}</Label>
+                <Select
+                  value={form.pipelineId || QUALQUER_FUNIL}
+                  onValueChange={(v) =>
+                    setForm((f) => ({ ...f, pipelineId: v === QUALQUER_FUNIL ? "" : v }))
+                  }
+                  disabled={etapasCarregando}
+                >
+                  <SelectTrigger id="trigger-lead-pipeline" data-testid="trigger-lead-pipeline">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={QUALQUER_FUNIL}>{t("Qualquer funil")}</SelectItem>
+                    {funis.map((funil) => (
+                      <SelectItem key={funil.id} value={funil.id}>
+                        {funil.nome}
+                      </SelectItem>
+                    ))}
+                    {/* Funil gravado que não está na lista (arquivado ou ainda
+                        carregando): mostrá-lo pelo nome em vez de deixar o
+                        seletor em branco — o valor continua no `trigger_config`. */}
+                    {form.pipelineId && !funis.some((f) => f.id === form.pipelineId) && (
+                      <SelectItem value={form.pipelineId}>
+                        {funilDoFiltro ?? t("escolhido")}
+                      </SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-lead-tag">{t("Etiqueta do negócio (opcional)")}</Label>
+                <Input
+                  id="trigger-lead-tag"
+                  placeholder={t("ex: vip")}
+                  value={form.tagDoNegocio}
+                  onChange={(e) => setForm((f) => ({ ...f, tagDoNegocio: e.target.value }))}
+                  data-testid="trigger-lead-tag"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "Só começa para negócios criados neste funil e/ou com esta etiqueta. Em branco = qualquer funil, qualquer etiqueta.",
+                  )}
+                </p>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "O fluxo começa quando um negócio nasce: a primeira mensagem que abre o card, um formulário ou o cadastro manual. Negócios importados por planilha não entram. A entrada na fila leva poucos minutos, não é instantânea.",
+                )}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                <strong className="font-medium">{t("Comece o fluxo por uma espera.")}</strong>{" "}
+                {t(
+                  "Quem escreveu pode receber a resposta do agente no mesmo instante — sem espera, saem duas mensagens juntas.",
+                )}
+              </p>
+            </div>
+          )}
+
           {form.kind === "webhook" && (
             <p className="text-xs text-muted-foreground">
               {t(
                 "O fluxo começa quando uma regra em Webhooks usa a ação «Iniciar fluxo de mensagem» apontando para este fluxo publicado.",
               )}
             </p>
+          )}
+
+          {form.kind === "inbound_after_silence" && (
+            <>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-retorno-valor">{t("Tempo sem o cliente falar")}</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="trigger-retorno-valor"
+                    type="number"
+                    min={1}
+                    value={form.thresholdValor}
+                    onChange={(e) => setForm((f) => ({ ...f, thresholdValor: Number(e.target.value) }))}
+                    aria-invalid={retornoInvalid}
+                  />
+                  <Select
+                    value={form.thresholdUnidade}
+                    onValueChange={(v) => setForm((f) => ({ ...f, thresholdUnidade: v as UnidadeDeLimiar }))}
+                  >
+                    <SelectTrigger id="trigger-retorno-unidade" className="w-32">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {UNIDADES_DE_LIMIAR.map((u) => (
+                        <SelectItem key={u} value={u}>
+                          {t(u === "minutes" ? "minutos" : u === "hours" ? "horas" : "dias")}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                {retornoInvalid && (
+                  <p className="text-xs text-error-fg">
+                    {t("Mínimo de")} 1 {t("hora")}. {t("Máximo de")} 90 {t("dias")}.
+                  </p>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "O fluxo começa quando o cliente escreve depois de ficar este tempo sem mandar mensagem. Não é o mesmo que silêncio: silêncio avisa enquanto ele some; este avisa quando ele volta.",
+                )}
+              </p>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-retorno-segments">{t("Segmentos (tags, opcional)")}</Label>
+                <Input
+                  id="trigger-retorno-segments"
+                  placeholder={t("ex: vip, carrinho-abandonado")}
+                  value={form.segments}
+                  onChange={(e) => setForm((f) => ({ ...f, segments: e.target.value }))}
+                />
+              </div>
+            </>
           )}
 
           {form.kind === "silence" && (
@@ -329,12 +723,33 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
                   onChange={(e) => setForm((f) => ({ ...f, thresholdMinutes: Number(e.target.value) }))}
                   aria-invalid={thresholdInvalid}
                 />
-                {thresholdInvalid && (
+                {thresholdInvalid && !tetoInvalid && !pausaInvalid && (
                   <p className="text-xs text-error-fg">{t("Mínimo de")} {MIN_THRESHOLD_MINUTES} {t("minutos.")}</p>
                 )}
               </div>
               <div className="space-y-2">
-                <Label htmlFor="trigger-segments">Segmentos (tags, opcional)</Label>
+                <Label htmlFor="trigger-max-silence">{t("Silêncio máximo, em minutos (opcional)")}</Label>
+                <Input
+                  id="trigger-max-silence"
+                  type="number"
+                  min={0}
+                  max={MAX_SILENCIO_MINUTOS}
+                  value={form.maxSilenceMinutes}
+                  onChange={(e) => setForm((f) => ({ ...f, maxSilenceMinutes: Number(e.target.value) }))}
+                  aria-invalid={tetoInvalid}
+                  data-testid="trigger-max-silence"
+                />
+                {tetoInvalid && (
+                  <p className="text-xs text-error-fg">{t("Precisa ser maior que o mínimo e no máximo 10080 (7 dias).")}</p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "Com um máximo, o fluxo só começa enquanto o silêncio for recente — por exemplo, entre 10 e 60 minutos depois da última mensagem do cliente. Quem está calado há mais tempo fica de fora. 0 = sem máximo.",
+                  )}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-segments">{t("Segmentos (tags, opcional)")}</Label>
                 <Input
                   id="trigger-segments"
                   placeholder={t("ex: vip, carrinho-abandonado")}
@@ -342,11 +757,92 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
                   onChange={(e) => setForm((f) => ({ ...f, segments: e.target.value }))}
                 />
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-reentry-pause">{t("Pausa antes de recomeçar (horas)")}</Label>
+                <Input
+                  id="trigger-reentry-pause"
+                  type="number"
+                  min={0}
+                  max={MAX_PAUSA_HORAS}
+                  value={form.reentryPauseHours}
+                  onChange={(e) => setForm((f) => ({ ...f, reentryPauseHours: Number(e.target.value) }))}
+                  aria-invalid={pausaInvalid}
+                  data-testid="trigger-reentry-pause"
+                />
+                {pausaInvalid && (
+                  <p className="text-xs text-error-fg">{t("Use de 0 a 2160 horas (90 dias).")}</p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "Vale para quem já passou por este fluxo e respondeu ou chegou ao fim: ele só recomeça depois deste tempo sem o cliente escrever. Quem nunca passou por ele entra no tempo de silêncio de sempre. 0 = sem pausa.",
+                  )}
+                </p>
+                {form.reentryPauseHours > 0 && (
+                  <div className="flex items-start justify-between gap-2">
+                    <Label htmlFor="trigger-pause-basis" className="text-xs font-normal leading-snug">
+                      {t("Contar a pausa a partir do último envio deste fluxo (e não da última mensagem do cliente)")}
+                    </Label>
+                    <Switch
+                      id="trigger-pause-basis"
+                      checked={form.pauseFromLastSend}
+                      onCheckedChange={(checked) => setForm((f) => ({ ...f, pauseFromLastSend: checked }))}
+                      data-testid="trigger-pause-basis"
+                    />
+                  </div>
+                )}
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="trigger-max-enrollments">
+                  {t("Quantas vezes no máximo, por contato (opcional)")}
+                </Label>
+                <Input
+                  id="trigger-max-enrollments"
+                  type="number"
+                  min={0}
+                  max={50}
+                  value={form.maxEnrollments}
+                  onChange={(e) => setForm((f) => ({ ...f, maxEnrollments: Number(e.target.value) }))}
+                  data-testid="trigger-max-enrollments"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "A pausa acima só espaça os reinícios: quem nunca responde volta a receber o fluxo a cada pausa, para sempre. Com um limite, o fluxo para de recomeçar depois deste número de vezes. 0 = sem limite.",
+                  )}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <Label
+                    htmlFor="trigger-exige-resposta"
+                    className="text-xs font-normal leading-snug"
+                  >
+                    {t("Só começar se a equipe já respondeu a última mensagem do cliente")}
+                  </Label>
+                  <Switch
+                    id="trigger-exige-resposta"
+                    checked={form.exigeResposta}
+                    onCheckedChange={(checked) => setForm((f) => ({ ...f, exigeResposta: checked }))}
+                    data-testid="trigger-exige-resposta"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t(
+                    "O tempo de silêncio conta da última mensagem do cliente, e mensagem da equipe não zera essa conta — então quem escreveu e ainda não foi atendido também entra no fluxo. Ligue isto quando o fluxo é para quem sumiu, e não para quem está esperando resposta.",
+                  )}
+                </p>
+              </div>
             </>
           )}
 
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor="trigger-cancel-on-reply">{t("Cancelar se o lead responder")}</Label>
+            {/* ⚠️ NÃO DESTRAVE ESTE INTERRUPTOR NO GATILHO DE FALTA. Ele é a
+                única coisa travada do painel porque não há escolha: a sequência
+                de falta só existe para o silêncio de quem não compareceu. O
+                valor que ele mostra vai no `trigger_config` (`toTriggerConfig`)
+                e, em fluxo antigo que ainda não tem o campo, o motor o lê como
+                `true` (`lib/followup/reactivity.ts`) — destravar aqui sem mudar
+                aqueles dois deixaria a tela mentindo de novo (#3400). */}
             <Switch
               id="trigger-cancel-on-reply"
               checked={form.kind === "appointment_no_show" || form.cancelOnReply}
@@ -354,6 +850,43 @@ export function TriggerConfigControl({ flowId, triggerConfig }: Props) {
               onCheckedChange={(checked) => setForm((f) => ({ ...f, cancelOnReply: checked }))}
             />
           </div>
+
+          {/* #3974 — a opção IRMÃ de "cancelar ao responder", e só no gatilho de
+              etapa: é o único que sabe qual card armou (o negócio que entrou na
+              etapa acima). Nos outros tipos o fluxo nasce sem card identificado,
+              e mover "o negócio do contato" ali seria escolher por quem monta o
+              fluxo quando o contato tem dois. */}
+          {form.kind === "stage_change" && (
+            <div className="space-y-2">
+              <Label htmlFor="trigger-move-on-reply">
+                {t("Quando o cliente responder, mover o card para")}
+              </Label>
+              <Select
+                value={form.moveToStageId || NAO_MOVER}
+                onValueChange={(v) => setForm((f) => ({ ...f, moveToStageId: v === NAO_MOVER ? "" : v }))}
+                disabled={etapasCarregando || etapasDoFunilDoGatilho.length === 0}
+              >
+                <SelectTrigger id="trigger-move-on-reply" data-testid="trigger-move-on-reply">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NAO_MOVER}>{t("Não mover o card")}</SelectItem>
+                  {etapasDoFunilDoGatilho
+                    .filter((etapa) => etapa.stageId !== form.stageId)
+                    .map((etapa) => (
+                      <SelectItem key={etapa.stageId} value={etapa.stageId}>
+                        {nomeDaEtapa(etapa)}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  "O card que este gatilho armou — o negócio do contato que está na etapa acima — vai para a etapa escolhida quando o cliente responder. Sem card nessa etapa, nada se move, e a trilha da inscrição registra o motivo.",
+                )}
+              </p>
+            </div>
+          )}
 
           <Button
             type="button"

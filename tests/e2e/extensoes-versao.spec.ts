@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 
-import { expect as expectBase, test, type BrowserContext, type Page } from "@playwright/test";
+import { esperarARevelacaoNasCargas, expect as expectBase, test, type BrowserContext, type Page } from "./helpers/test";
 
 import {
   criarAtoresDasExtensoes,
@@ -61,7 +61,7 @@ async function login(page: Page, email: string, senha: string): Promise<void> {
   await page.goto("/login");
   await page.getByLabel(/e-?mail/i).fill(email);
   await page.getByLabel(/senha/i).fill(senha);
-  await page.getByRole("button", { name: /entrar/i }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
   await page.waitForURL(/\/app(?:\/|$)/, { timeout: 60_000 });
 }
 
@@ -244,6 +244,7 @@ test("atualiza, desfaz com o catálogo fora do ar, remove e reinstala sem decidi
     // Outra sessão do mesmo responsável, aberta ANTES do desfazer: armazenamento próprio, então
     // nada a avisa da troca até ela tentar agir.
     const contexto = await browser.newContext();
+    contexto.on("page", esperarARevelacaoNasCargas);
     contextosExtras.push(contexto);
     const antiga = await contexto.newPage();
     await registrarAvisos(antiga);

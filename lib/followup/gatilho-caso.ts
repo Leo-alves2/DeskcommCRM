@@ -56,7 +56,13 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { EventRow } from "@/lib/event-log/dispatcher";
 import { flowGraphSchema } from "./graph-schema";
 import { triggerConfigSchema } from "./api-schemas";
-import { resolveAgentForAutomaticTrigger, type FollowupGateDb } from "./agent-followup-gate";
+import {
+  canalDaConversaSupabase,
+  decidirAgenteDoEnrollmentAutomatico,
+  noDeGatilhoDoGrafo,
+  type FollowupGateDb,
+  type NoDeGatilho,
+} from "./agent-followup-gate";
 
 /** Os dois eventos deste produtor. Constantes porque o handler, o registro e os
  *  testes precisam do MESMO literal — cópias divergem no primeiro ajuste. */
@@ -89,7 +95,17 @@ export interface GatilhoCasoDb {
   carregaPointersDeCaso(orgId: string): Promise<PointerDeCaso[]>;
   /** Fallback: o payload do trigger já traz `contact_id`; isto só roda se faltar. */
   carregaContatoDaConversa(orgId: string, conversationId: string): Promise<string | null>;
-  carregaNoDeGatilho(orgId: string, versionId: string): Promise<string | null>;
+  /**
+   * Canal (`conversations.channel_session_id`) da conversa do CASO — o número em
+   * que a persona vai falar (#3852). `null` = desconhecido, e a decisão do
+   * agente volta a ser por organização (comportamento de sempre).
+   *
+   * OPCIONAL pela mesma razão dos métodos opcionais do silence-sweep: os dublês
+   * dos testes implementam só o que medem, e a ausência não pode quebrar a
+   * chamada.
+   */
+  carregaCanalDaConversa?(orgId: string, conversationId: string): Promise<string | null>;
+  carregaNoDeGatilho(orgId: string, versionId: string): Promise<NoDeGatilho | null>;
   insereEnrollment(input: {
     source_case_id?: string | null;
     organization_id: string;
@@ -247,15 +263,24 @@ export async function aplicaGatilhoDeCaso(
     return summary;
   }
 
+  // #3852: o caso aconteceu numa conversa, e essa conversa tem UM número. Sem
+  // ele, o fluxo do agente A escrevia com a persona dele no número do agente B.
+  const canalConversa = (await deps.db.carregaCanalDaConversa?.(row.organization_id, conversationId)) ?? null;
+
   for (const pointer of armados) {
-    const agentId = await resolveAgentForAutomaticTrigger(deps.gateDb, row.organization_id, pointer.id);
-    if (agentId === null) {
+    const noDeGatilho = await deps.db.carregaNoDeGatilho(row.organization_id, pointer.active_version_id);
+    if (!noDeGatilho) continue;
+    const { agentId, barrado } = await decidirAgenteDoEnrollmentAutomatico(
+      deps.gateDb,
+      row.organization_id,
+      pointer.id,
+      noDeGatilho.pedeAgente,
+      canalConversa,
+    );
+    if (barrado) {
       summary.pointers_barrados_pelo_gate++;
       continue;
     }
-
-    const noDeGatilho = await deps.db.carregaNoDeGatilho(row.organization_id, pointer.active_version_id);
-    if (!noDeGatilho) continue;
 
     const { inserted, id, reason } = await deps.db.insereEnrollment({
       source_case_id: textoOuNulo(row.payload.case_id),
@@ -264,7 +289,7 @@ export async function aplicaGatilhoDeCaso(
       version_id: pointer.active_version_id,
       contact_id: contatoId,
       conversation_id: conversationId,
-      current_node_id: noDeGatilho,
+      current_node_id: noDeGatilho.id,
       agent_id: agentId,
     });
     if (!inserted) {
@@ -278,7 +303,7 @@ export async function aplicaGatilhoDeCaso(
       await deps.db.insereEventoDoEnrollment({
         organization_id: row.organization_id,
         enrollment_id: id,
-        node_id: noDeGatilho,
+        node_id: noDeGatilho.id,
         event_type: "enrolled_by_case_opened",
         payload: {
           case_id: textoOuNulo(row.payload.case_id),
@@ -305,7 +330,7 @@ export function createSupabaseGatilhoCasoDb(admin: SupabaseClient): GatilhoCasoD
     async carregaPointersDeCaso(orgId) {
       const { data, error } = await admin
         .from("followup_flow_pointers")
-        .select("id, organization_id, active_version_id, trigger_config")
+        .select("id, organization_id, active_version_id, trigger_config, surface")
         .eq("organization_id", orgId)
         .eq("status", "active")
         .not("active_version_id", "is", null);
@@ -317,8 +342,11 @@ export function createSupabaseGatilhoCasoDb(admin: SupabaseClient): GatilhoCasoD
         organization_id: string;
         active_version_id: string | null;
         trigger_config: unknown;
+        surface?: string | null;
       }>) {
-        if (!row.active_version_id) continue;
+        // Roteiro de atendimento (0394) é do turno, nunca do relógio: o banco
+        // já o prende em gatilho manual, e este corte é a segunda porta.
+        if (!row.active_version_id || row.surface === "atendimento") continue;
         // Mesmo schema do publish: `trigger_config` que não passa nele não arma
         // nada, em vez de armar torto.
         const parsed = triggerConfigSchema.safeParse(row.trigger_config);
@@ -343,6 +371,11 @@ export function createSupabaseGatilhoCasoDb(admin: SupabaseClient): GatilhoCasoD
       return data?.contact_id ?? null;
     },
 
+    carregaCanalDaConversa(orgId, conversationId) {
+      // A leitura é a MESMA do gate — uma régua, um lugar (#3852).
+      return canalDaConversaSupabase(admin, orgId, conversationId);
+    },
+
     async carregaNoDeGatilho(orgId, versionId) {
       const { data, error } = await admin
         .from("followup_flow_versions")
@@ -353,7 +386,7 @@ export function createSupabaseGatilhoCasoDb(admin: SupabaseClient): GatilhoCasoD
       if (error) throw new Error(error.message);
       if (!data) return null;
       const graph = flowGraphSchema.parse(data.graph);
-      return graph.nodes.find((n) => n.type === "trigger")?.id ?? null;
+      return noDeGatilhoDoGrafo(graph);
     },
 
     async insereEnrollment(input) {

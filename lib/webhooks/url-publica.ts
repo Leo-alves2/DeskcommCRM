@@ -24,3 +24,50 @@ export function basePublicaDaInstalacao(req: { headers: Headers; nextUrl: URL })
   // override do número (`(#100) Invalid callback URL`).
   return base.replace(/\/+$/, "");
 }
+
+/**
+ * A base do callback da META — e só dela (#1426). `META_WEBHOOK_BASE_URL`, quando
+ * definida, deixa o painel numa rede privada e expõe à Meta só `/api/v1/webhooks/meta/*`.
+ *
+ * NÃO mora dentro de `basePublicaDaInstalacao`: aquela também monta a URL de webhook
+ * dos canais parceiros (`channels/partner` e `channels/graph-partner`, em
+ * `/api/v1/webhooks/channel/<token>`), e a variável trocaria a URL deles para um
+ * endereço que o proxy da receita da issue bloqueia.
+ */
+export function basePublicaDoWebhookMeta(req: { headers: Headers; nextUrl: URL }): string {
+  const configurada = env.META_WEBHOOK_BASE_URL.trim();
+  if (configurada && !configurada.includes("placeholder.invalid")) {
+    return configurada.replace(/\/+$/, "");
+  }
+  return basePublicaDaInstalacao(req);
+}
+
+const MAQUINA_LOCAL = new Set(["localhost", "127.0.0.1", "[::1]", "::1", "0.0.0.0"]);
+
+/** O endereço aponta para a própria máquina? URL inválida conta como não. */
+export function enderecoDaPropriaMaquina(url: string): boolean {
+  try {
+    return MAQUINA_LOCAL.has(new URL(url).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A base pública CONFIGURADA da instalação — sem cair na requisição.
+ *
+ * Irmã de `basePublicaDaInstalacao`, para o que a instalação grava num terceiro
+ * em nome de TODAS as organizações (o webhook único do provedor parceiro). Ali
+ * o `Origin` de quem clicou não serve de fallback: qualquer admin de qualquer
+ * organização escolheria para onde vão os eventos de todos os números.
+ *
+ * `null` quando não há base utilizável: ausente, o `placeholder.invalid` da
+ * imagem genérica, ou a própria máquina — que só vale quando o outro lado
+ * também está nela (`aceitarMaquinaLocal`, o dublê das provas de tela).
+ */
+export function basePublicaConfiguradaDaInstalacao(opcoes: { aceitarMaquinaLocal: boolean }): string | null {
+  const configurada = env.NEXT_PUBLIC_APP_URL?.trim();
+  if (!configurada || configurada.includes("placeholder.invalid")) return null;
+  if (!opcoes.aceitarMaquinaLocal && enderecoDaPropriaMaquina(configurada)) return null;
+  return configurada.replace(/\/+$/, "");
+}

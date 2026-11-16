@@ -77,7 +77,7 @@ export async function login(page: Page, email: string, senha: string): Promise<v
     await page.goto("/login");
     await page.locator("#email").fill(email);
     await page.locator("#password").fill(senha);
-    await page.getByRole("button", { name: /entrar/i }).click();
+    await page.getByRole("button", { name: "Entrar", exact: true }).click();
     try {
       await page.waitForURL(/\/app/, { timeout: 45_000 });
       if (i > 1) registra(`[ambiente] login de ${email} só entrou na tentativa ${i}`);
@@ -97,7 +97,8 @@ export async function login(page: Page, email: string, senha: string): Promise<v
 
 export async function captura(page: Page, nome: string): Promise<void> {
   fs.mkdirSync(EVIDENCIA, { recursive: true });
-  await page.screenshot({ path: path.join(EVIDENCIA, `${nome}.png`), fullPage: true });
+  // Transições CSS terminadas: um interruptor recém-ligado sairia na foto a meio caminho.
+  await page.screenshot({ path: path.join(EVIDENCIA, `${nome}.png`), fullPage: true, animations: "disabled" });
 }
 
 /**
@@ -124,7 +125,7 @@ export async function abreConversa(page: Page, conversaId: string): Promise<void
 export async function abreQuadro(page: Page, pipelineId: string, titulo: string): Promise<void> {
   for (let i = 1; i <= 6; i++) {
     await page.goto(`/app/pipelines/${pipelineId}`);
-    const card = page.getByRole("group", { name: `Lead: ${titulo}` });
+    const card = page.getByRole("group", { name: `Negócio: ${titulo}` });
     const erro = page.getByText(/Não consegui carregar este funil/);
     const vencedor = await Promise.race([
       card.waitFor({ state: "visible", timeout: 45_000 }).then(() => "card" as const),

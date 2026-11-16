@@ -45,7 +45,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page } from "./helpers/test";
 import { createClient } from "@supabase/supabase-js";
 
 import { generateTotp, msUntilNextTotpWindow } from "./utils/totp";
@@ -78,7 +78,7 @@ async function preencheLogin(page: Page, email: string): Promise<void> {
   await expect(page.locator("#email")).toBeVisible({ timeout: ESPERA });
   await page.locator("#email").fill(email);
   await page.locator("#password").fill(creds.password);
-  await page.getByRole("button", { name: /entrar/i }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
 }
 
 async function loginSimples(page: Page, email: string): Promise<void> {
@@ -204,8 +204,10 @@ test.describe("aviso de caso no WhatsApp", () => {
     // ─── 4. o interruptor está travado, e o motivo está escrito ───────────
     const interruptor = page.getByRole("switch", { name: "Receber avisos no WhatsApp" });
     await expect(interruptor).toBeDisabled();
+    const respostaWhatsApp = page.getByRole("switch", { name: "Responder casos por este WhatsApp" });
+    await expect(respostaWhatsApp).toBeDisabled();
     await expect(
-      page.getByText(/O aviso sai na hora, inclusive fora do horário comercial/),
+      page.getByText(/Os avisos podem sair fora do horário comercial/),
       "a decisão de mandar fora do horário é do dono e mora na tela, não num comentário",
     ).toBeVisible();
 
@@ -218,7 +220,9 @@ test.describe("aviso de caso no WhatsApp", () => {
 
     // ─── 6. o seletor fala de CAPACIDADE, nunca de provedor ───────────────
     await expect(
-      page.getByText("Só aparecem aqui os números que conseguem mandar uma mensagem a qualquer hora."),
+      page.getByText(
+        "Aparecem aqui os números que mandam mensagem a qualquer hora e os números oficiais que já têm um modelo aprovado com uma variável.",
+      ),
     ).toBeVisible();
     await page.locator("#conexao").click();
     const opcoes = page.getByRole("option");
@@ -235,7 +239,18 @@ test.describe("aviso de caso no WhatsApp", () => {
 
     await page.getByRole("button", { name: /^Salvar$/ }).click();
     await expect(page.getByText("Aviso salvo.").first()).toBeVisible({ timeout: ESPERA });
+    await expect(respostaWhatsApp).toHaveAttribute("aria-checked", "false");
     await captura(page, "30-configurado-mas-recusado");
+
+    // A opção começa desligada numa empresa nova, mas pode ser habilitada pelo
+    // administrador depois que o número e a conexão foram salvos.
+    await expect(respostaWhatsApp).toBeEnabled();
+    await respostaWhatsApp.click();
+    await expect(respostaWhatsApp).toHaveAttribute("aria-checked", "true");
+    await page.getByRole("button", { name: /^Salvar$/ }).click();
+    await expect(page.getByText("Aviso salvo.").first()).toBeVisible({ timeout: ESPERA });
+    await expect(respostaWhatsApp).toHaveAttribute("aria-checked", "true");
+    await captura(page, "35-resposta-pelo-whatsapp-habilitada");
 
     // ─── 8. o teste RECUSA, e diz o motivo em português ───────────────────
     //

@@ -11,41 +11,47 @@
  * Auth: header `Authorization: Bearer <INTERNAL_CRON_SECRET>` (preferred) or
  * `<INTERNAL_SECRET>` (fallback), same pattern as agent-dispatcher. The
  * X-Cron-Secret header is also accepted as alias.
+ *
+ * ─── UM DRENO POR VEZ (issue #2235) ──────────────────────────────────────────
+ *
+ * A MESMA rota é armada por dois agendadores na mesma instalação: o cron do
+ * contêiner (`docker/scheduler/entrypoint.sh:59`) e o crontab do host que o kit
+ * grava (`hostgator-setup-kit/_common.sh`, `setup_event_log_drain_cron`). Em vez
+ * de escolher um (o `update.sh` recoloca a linha do host, e o worker depende do
+ * cron como rede de segurança), a passada é serializada por uma trava de
+ * sessão no BANCO — ver `lib/event-log/trava-do-dreno.ts` para o porquê do
+ * banco, do lock de sessão e do 200.
+ *
+ * Contrato preservado: mesma rota, mesma auth, mesmo 200 no caso normal. Quem
+ * chega enquanto outra passada drena recebe `200 { data: { ok: true, pulado:
+ * "outro_dreno" } }` e NÃO toca a fila. 409 quebraria os dois crons, que tratam
+ * qualquer não-2xx como falha.
  */
 import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 
 import { ok, fail } from "@/lib/api/wrappers";
-import { env } from "@/lib/env";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { drainEventLog } from "@/lib/event-log/drain";
+import { drenarSozinho } from "@/lib/event-log/trava-do-dreno";
 import { ensureHandlersRegistered } from "@/lib/event-log/register-handlers";
 import { logger } from "@/lib/logger";
+import { autorizaCron } from "@/lib/auth/cron-auth";
 
 export const dynamic = "force-dynamic";
 
 async function handle(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
-  const auth = req.headers.get("authorization") ?? "";
-  const bearer = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
-  const headerSecret = req.headers.get("x-cron-secret")?.trim() ?? "";
-  const provided = bearer || headerSecret;
-
-  const cronSecret = env.INTERNAL_CRON_SECRET;
-  const fallbackSecret = env.INTERNAL_SECRET;
-  const accepted: string[] = [];
-  if (cronSecret) accepted.push(cronSecret);
-  if (fallbackSecret) accepted.push(fallbackSecret);
-
-  if (accepted.length === 0 || !provided || !accepted.includes(provided)) {
+  if (!autorizaCron(req)) {
     return fail("forbidden", "Cron secret missing or invalid.", 403, { requestId });
   }
 
   ensureHandlersRegistered();
   try {
-    const summary = await drainEventLog(createAdminClient());
-    return ok(summary, { requestId });
+    // 200 também quando outra passada está drenando (`pulado: "outro_dreno"`):
+    // os dois crons tratam não-2xx como falha. Ver `trava-do-dreno.ts`.
+    const resumo = await drenarSozinho(createAdminClient());
+    return ok(resumo, { requestId });
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     logger.error("[event-log-drain.cron] threw", { error: detail, requestId });

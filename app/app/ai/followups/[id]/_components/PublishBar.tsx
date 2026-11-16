@@ -23,6 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import { ApiError } from "@/lib/api/types";
 import type { FlowGraph } from "@/lib/followup/graph-schema";
@@ -34,11 +35,13 @@ import {
   useRollbackFollowupFlow,
   useSaveFollowupFlowDraft,
   useUpdateHandoffPolicy,
+  useUpdateSendWhenAssigned,
   type FollowupFlowDetailRow,
 } from "@/hooks/followup/useFollowupFlow";
 import { Trash, TreeStructure } from "@/lib/ui/icons";
 import { FlowStatusBadge } from "../../_components/FlowStatusBadge";
 import { DeleteFollowupFlowButton } from "../../_components/DeleteFollowupFlowButton";
+import { RenameFollowupFlowButton } from "../../_components/RenameFollowupFlowButton";
 import { TriggerConfigControl } from "./TriggerConfigControl";
 
 interface Props {
@@ -81,6 +84,8 @@ export function PublishBar({
   const disable = useDisableFollowupFlow(flowId);
   const rollback = useRollbackFollowupFlow(flowId);
   const handoffPolicy = useUpdateHandoffPolicy(flowId);
+  const sendWhenAssigned = useUpdateSendWhenAssigned(flowId);
+  const deRoteiro = flow.surface === "atendimento";
 
   const onSave = () => {
     save.mutate(graph, { onSuccess: () => onSaved(graph) });
@@ -124,12 +129,20 @@ export function PublishBar({
     rollback.mutate(flow.previous_version_id);
   };
 
-  const busy = save.isPending || publish.isPending || disable.isPending || rollback.isPending;
+  const busy =
+    save.isPending || publish.isPending || disable.isPending || rollback.isPending;
+  const busyDaOpcao = busy || sendWhenAssigned.isPending;
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-surface px-4 py-3">
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1">
         <h1 className="text-sm font-semibold text-text">{flow.name}</h1>
+        <RenameFollowupFlowButton
+          flowId={flowId}
+          flowName={flow.name}
+          variant="ghost"
+          size="icon"
+        />
         <FlowStatusBadge status={flow.status} />
         {dirty && (
           <Badge variant="warning" data-testid="dirty-indicator">
@@ -139,20 +152,47 @@ export function PublishBar({
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
-        <TriggerConfigControl flowId={flowId} triggerConfig={flow.trigger_config} />
+        {/* O roteiro de atendimento começa por palavra-gatilho ou roteador (no
+            Início do grafo) e encerra quando um humano assume (0397): o gatilho
+            de relógio e a política de handoff do follow-up não valem para ele —
+            na prova do #1130 esta barra aparecia igual e confundia. */}
+        {!deRoteiro && <TriggerConfigControl flowId={flowId} triggerConfig={flow.trigger_config} />}
 
-        <Select value={flow.handoff_policy} onValueChange={(v) => handoffPolicy.mutate(v as FollowupFlowDetailRow["handoff_policy"])}>
-          <SelectTrigger className="w-56" aria-label={t("Política de handoff")}>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {(Object.keys(HANDOFF_LABEL) as Array<keyof typeof HANDOFF_LABEL>).map((k) => (
-              <SelectItem key={k} value={k}>
-                {t(HANDOFF_LABEL[k])}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {!deRoteiro && (
+          <Select value={flow.handoff_policy} onValueChange={(v) => handoffPolicy.mutate(v as FollowupFlowDetailRow["handoff_policy"])}>
+            <SelectTrigger className="w-56" aria-label={t("Política de handoff")}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(HANDOFF_LABEL) as Array<keyof typeof HANDOFF_LABEL>).map((k) => (
+                <SelectItem key={k} value={k}>
+                  {t(HANDOFF_LABEL[k])}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+
+        {/* #3974 — a opção do FLUXO, ao lado da política de handoff: o que muda
+            é o follow-up PROGRAMADO poder sair com uma pessoa dona da conversa.
+            A política de handoff continua valendo para a IA responder. */}
+        {!deRoteiro && (
+          <label
+            className="flex items-center gap-2 text-xs text-text"
+            title={t(
+              "Os passos de texto deste fluxo saem mesmo quando um atendente é o dono da conversa. A IA continua calada nessa conversa, e contatos com opt-out, bloqueados ou fora da janela de envio não recebem.",
+            )}
+          >
+            <Switch
+              checked={flow.send_when_assigned === true}
+              onCheckedChange={(v) => sendWhenAssigned.mutate(v)}
+              disabled={busyDaOpcao}
+              aria-label={t("Enviar mesmo com a conversa atribuída a uma pessoa")}
+              data-testid="send-when-assigned"
+            />
+            <span>{t("Enviar com a conversa atribuída")}</span>
+          </label>
+        )}
 
         <Button type="button" variant="secondary" size="sm" disabled={!dirty || busy} onClick={onSave}>
           {save.isPending ? t("Salvando…") : t("Salvar")}
@@ -233,7 +273,12 @@ export function PublishBar({
             </AlertDialog>
           </>
         ) : (
-          <DeleteFollowupFlowButton flowId={flowId} flowName={flow.name} redirectToList />
+          <DeleteFollowupFlowButton
+            flowId={flowId}
+            flowName={flow.name}
+            redirectToList
+            listHref={deRoteiro ? "/app/ai/atendimento" : "/app/ai/followups"}
+          />
         )}
       </div>
     </div>

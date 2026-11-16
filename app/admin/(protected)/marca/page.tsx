@@ -1,10 +1,22 @@
 import { notFound } from "next/navigation";
 
+import { CssPersonalizado } from "./_css-personalizado";
+import { TemaDaPlataforma } from "./_tema-da-plataforma";
 import { loadAuthUser } from "@/lib/auth/server";
+import {
+  cssPersonalizadoDaInstalacao,
+  cssPersonalizadoEscuroDaInstalacao,
+  validarCssPersonalizado,
+} from "@/lib/branding/css-personalizado";
 import { marcaDaInstalacao } from "@/lib/branding/instalacao";
+import { logoDaCamada } from "@/lib/branding/logo";
 import { REGUA_DO_PRODUTO } from "@/lib/branding/regua-do-produto";
 import { camadaDaInstalacao, camadaDoAmbiente, resolverMarca } from "@/lib/branding/resolve";
 import { env } from "@/lib/env";
+import {
+  idDoTemaDaPlataforma,
+  temasInstaladosDaPlataforma,
+} from "@/lib/extensions/tema-da-plataforma";
 import { tagDeIdioma } from "@/lib/i18n/datas";
 import { normalizarIdioma } from "@/lib/i18n/idiomas";
 import { traduzir } from "@/lib/i18n/dicionario";
@@ -59,14 +71,22 @@ export default async function Page() {
   if (!usuario?.is_platform_admin) notFound();
   const idioma = normalizarIdioma(usuario.locale);
 
-  const linha = await marcaDaInstalacao();
+  const [linha, cssPersonalizado, cssPersonalizadoEscuro, temasInstalados, temaEscolhido] =
+    await Promise.all([
+      marcaDaInstalacao(),
+      cssPersonalizadoDaInstalacao(),
+      cssPersonalizadoEscuroDaInstalacao(),
+      temasInstaladosDaPlataforma(),
+      idDoTemaDaPlataforma(),
+    ]);
+  // Cada campo com o SEU escopo: é o mesmo prefixo que o layout aplica, então a
+  // tela relata exatamente o que está valendo (ou o erro do campo certo).
+  const validacaoCss = validarCssPersonalizado(cssPersonalizado, "claro");
+  const validacaoCssEscuro = validarCssPersonalizado(cssPersonalizadoEscuro, "escuro");
   // A MESMA pilha do `app/layout.tsx` — banco acima, arquivo de instalação
   // embaixo. Montar outra aqui faria a tela relatar uma precedência que o
   // produto não usa, que é a pior mentira possível numa tela de diagnóstico.
-  const marca = resolverMarca(
-    [camadaDaInstalacao(linha), camadaDoAmbiente(env)],
-    REGUA_DO_PRODUTO,
-  );
+  const marca = resolverMarca([camadaDaInstalacao(linha), camadaDoAmbiente(env)], REGUA_DO_PRODUTO);
 
   // O que apareceria SEM o arquivo subido — a MESMA pilha com `logo_path`
   // zerado, e não uma leitura solta de `APP_LOGO_URL`. É assim que a prévia
@@ -96,12 +116,16 @@ export default async function Page() {
           logo_url: linha?.logo_url ?? null,
           logo_path: linha?.logo_path ?? null,
           accent_hex: linha?.accent_hex ?? null,
+          accent_dark_hex: linha?.accent_dark_hex ?? null,
           // `true` é o default da coluna: sem linha ainda, é o valor que o
           // `upsert` gravaria de qualquer forma.
           show_powered_by: linha?.show_powered_by ?? true,
         }}
         nomeEmVigor={marca.name}
         logoEmVigor={marca.logoUrl}
+        logoEscuroEmVigor={marca.logoDarkUrl}
+        // Mesma conversão caminho → URL do logo; `null` sem arquivo subido.
+        iconeDaAba={logoDaCamada(linha?.favicon_path, null)}
         logoDoAmbiente={semOArquivo.logoUrl}
         origens={marca.origens}
         // `seeded_from_env` ligado significa que a linha é cópia do arquivo de
@@ -109,6 +133,23 @@ export default async function Page() {
         definidoNestaTela={linha !== null && !linha.seeded_from_env}
         fallbackEm={instanteLegivel(linha?.fallback_at ?? null, tagDeIdioma(idioma))}
         fallbackMotivo={linha?.fallback_reason ?? null}
+      />
+      <TemaDaPlataforma
+        // Só o que o seletor mostra: a LEITURA da plataforma reconfere o id no
+        // banco a cada render, então a tela não precisa entregar o tema inteiro.
+        temas={temasInstalados.map((tema) => ({
+          instalacaoId: tema.instalacaoId,
+          rotulo: tema.rotulo,
+          versao: tema.versao,
+          paleta: tema.tema.palette,
+        }))}
+        escolhido={temaEscolhido}
+      />
+      <CssPersonalizado
+        gravado={cssPersonalizado}
+        gravadoEscuro={cssPersonalizadoEscuro}
+        erroAtual={validacaoCss.erro}
+        erroAtualEscuro={validacaoCssEscuro.erro}
       />
     </div>
   );

@@ -30,16 +30,20 @@ type Row = Record<string, unknown>;
 function makeDb({
   leads = [],
   stages = [],
+  pipelines = [],
   updateError,
 }: {
   leads?: Row[];
   stages?: Row[];
+  /** Linhas de `crm_pipelines` — é de lá que vem o `settings` do funil (#1536). */
+  pipelines?: Row[];
   /** Simula o `error` que o Postgres devolveria no UPDATE de `crm_leads`. */
   updateError?: { code?: string; message?: string };
 } = {}) {
   const tables: Record<string, Row[]> = {
     crm_leads: leads,
     crm_stages: stages,
+    crm_pipelines: pipelines,
     crm_lead_activities: [],
   };
   const updates: Row[] = [];
@@ -55,7 +59,8 @@ function makeDb({
 
     const builder = {
       select: () => {
-        operation = "select";
+        // `update(...).select("id")` continua sendo o update: devolve as linhas que ele alcançou.
+        if (operation !== "update") operation = "select";
         return builder;
       },
       update: (value: Row) => {
@@ -100,8 +105,10 @@ function makeDb({
             return resolve({ data: null, error: updateError });
           }
           const rows = tables[table] ?? [];
+          const alcancadas: Row[] = [];
           for (const row of rows) {
             if (filters.every(([column, value]) => row[column] === value)) {
+              alcancadas.push(row);
               Object.assign(row, patch);
               const stage = stages.find((candidate) => candidate.id === row.stage_id);
               if (stage?.is_won === true) {
@@ -113,6 +120,7 @@ function makeDb({
               }
             }
           }
+          return resolve({ data: alcancadas.map((row) => ({ id: row.id })), error: null });
         } else if (operation === "insert" && insertRow) {
           (tables[table] ??= []).push(insertRow);
         }
@@ -204,19 +212,22 @@ describe("encerraDemanda", () => {
     expect(db.updates[0]).toMatchObject({ stage_id: WON_STAGE });
   });
 
-  it("move para o fim da stage, preserva a fonte única de evento e fecha como ganho", async () => {
+  it("entra no TOPO da stage (#3461), preserva a fonte única de evento e fecha como ganho", async () => {
+    // Dois já ganhos, o de MENOR posição no fim da lista: o encerrado entra um
+    // passo acima do primeiro da coluna (2000 − 1000), nunca abaixo do último.
     const db = makeDb({
       leads: [
         baseLead(),
         baseLead({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", stage_id: WON_STAGE, position_in_stage: 4000, status: "won" }),
+        baseLead({ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", stage_id: WON_STAGE, position_in_stage: 2000, status: "won" }),
       ],
       stages: baseStages(),
     });
 
     const result = await encerraDemanda(db.client as never, ctx, { leadId: LEAD, desfecho: "won" });
 
-    expect(result.lead).toMatchObject({ status: "won", stage_id: WON_STAGE, position_in_stage: 5000 });
-    expect(db.updates[0]).toMatchObject({ stage_id: WON_STAGE, position_in_stage: 5000 });
+    expect(result.lead).toMatchObject({ status: "won", stage_id: WON_STAGE, position_in_stage: 1000 });
+    expect(db.updates[0]).toMatchObject({ stage_id: WON_STAGE, position_in_stage: 1000 });
     expect(db.rpcs).toEqual([]);
   });
 
@@ -243,6 +254,50 @@ describe("encerraDemanda", () => {
     expect(db.rpcs).toEqual([]);
   });
 
+  it("o fecho humano (sem `travaOtimista`) segue sem trava: não filtra status nem etapa de origem", async () => {
+    const db = makeDb({ leads: [baseLead()], stages: baseStages() });
+    const filtrosDoUpdate: Array<[string, unknown]> = [];
+    const fromOriginal = db.client.from;
+    db.client.from = (table: string) => {
+      const b = fromOriginal(table);
+      const eqOriginal = b.eq;
+      let ehUpdate = false;
+      const updOriginal = b.update;
+      b.update = (v: Row) => ((ehUpdate = true), updOriginal(v));
+      b.eq = (c: string, v: unknown) => (ehUpdate && table === "crm_leads" && filtrosDoUpdate.push([c, v]), eqOriginal(c, v));
+      return b;
+    };
+
+    await encerraDemanda(db.client as never, ctx, { leadId: LEAD, desfecho: "won" });
+
+    expect(filtrosDoUpdate.map(([c]) => c).sort()).toEqual(["id", "organization_id"]);
+  });
+
+  it("com `travaOtimista`: negócio já PERDIDO na leitura do fecho → 409 state_conflict e nenhum update", async () => {
+    const db = makeDb({ leads: [baseLead({ status: "lost", stage_id: LOST_STAGE })], stages: baseStages() });
+
+    await expect(
+      encerraDemanda(db.client as never, ctx, { leadId: LEAD, desfecho: "won", travaOtimista: true }),
+    ).rejects.toMatchObject({ code: "state_conflict", status: 409 });
+    expect(db.updates).toEqual([]);
+  });
+
+  it("com `travaOtimista`: o card mudou entre a leitura e a escrita → o update não alcança linha e vira 409 state_conflict", async () => {
+    const db = makeDb({ leads: [baseLead()], stages: baseStages() });
+    // Um humano arrasta o card enquanto o fecho valida a régua (a leitura de settings do funil).
+    // Troca a LINHA (o dublê devolve a linha por referência ao fecho).
+    const fromOriginal = db.client.from;
+    db.client.from = (table: string) => {
+      if (table === "crm_pipelines") db.tables.crm_leads!.splice(0, 1, baseLead({ stage_id: LOST_STAGE, status: "lost" }));
+      return fromOriginal(table);
+    };
+
+    await expect(
+      encerraDemanda(db.client as never, ctx, { leadId: LEAD, desfecho: "won", travaOtimista: true }),
+    ).rejects.toMatchObject({ code: "state_conflict", status: 409 });
+    expect(db.tables.crm_leads?.[0]).toMatchObject({ stage_id: LOST_STAGE, status: "lost" });
+  });
+
   // BUG REPRODUZIDO (crm.fabrasoftware.com.br): a recusa de
   // `fn_validate_lost_reason_required` (22023 `lost_reason_invalid`) chegava
   // como 500 `internal_error` com o texto cru do Postgres — `/lose` e `/win`
@@ -262,6 +317,132 @@ describe("encerraDemanda", () => {
         motivo: "Lead optou em outra solução",
       }),
     ).rejects.toMatchObject({ code: "lost_reason_invalid", status: 422 });
+  });
+
+  // ── CAMPOS OBRIGATÓRIOS E MOTIVO DE GANHO (issue #1536) ────────────────────
+  //
+  // O caminho 3 dos SEIS (o botão ganhar/perder — e com ele `/win`, `/lose`,
+  // `crm_close_demand` e o fecho da ação, que todos passam por esta função).
+  const FUNIL_EXIGENTE = [
+    {
+      id: PIPELINE,
+      organization_id: ORG,
+      settings: {
+        won_reason_required: true,
+        won_reasons: ["Renovação"],
+        fields: [
+          {
+            key: "concorrente",
+            label: "Concorrente",
+            type: "text",
+            obrigatorio_em: { ao_perder: true },
+          },
+        ],
+      },
+    },
+  ];
+
+  it("fecho como PERDIDO sem o campo exigido: 422 required_fields_missing e nenhum update", async () => {
+    const db = makeDb({
+      leads: [baseLead({ custom_fields: {} })],
+      stages: baseStages(),
+      pipelines: FUNIL_EXIGENTE,
+    });
+
+    await expect(
+      encerraDemanda(db.client as never, ctx, {
+        leadId: LEAD,
+        desfecho: "lost",
+        motivo: "price",
+      }),
+    ).rejects.toMatchObject({
+      code: "required_fields_missing",
+      status: 422,
+      details: { faltando: [{ chave: "concorrente", rotulo: "Concorrente" }] },
+    });
+    expect(db.updates).toEqual([]);
+  });
+
+  it("mesmo fecho com o campo preenchido passa (controle negativo do anterior)", async () => {
+    const db = makeDb({
+      leads: [baseLead({ custom_fields: { concorrente: "ACME" } })],
+      stages: baseStages(),
+      pipelines: FUNIL_EXIGENTE,
+    });
+
+    const result = await encerraDemanda(db.client as never, ctx, {
+      leadId: LEAD,
+      desfecho: "lost",
+      motivo: "price",
+    });
+    expect(result.lead).toMatchObject({ status: "lost" });
+    expect(db.updates[0]).toMatchObject({ lost_reason: "price" });
+  });
+
+  it("ganho com motivo exigido ausente: o `won_reason` é o faltando do MESMO contrato", async () => {
+    const db = makeDb({
+      leads: [baseLead()],
+      stages: baseStages(),
+      pipelines: FUNIL_EXIGENTE,
+    });
+
+    await expect(
+      encerraDemanda(db.client as never, ctx, { leadId: LEAD, desfecho: "won" }),
+    ).rejects.toMatchObject({
+      code: "required_fields_missing",
+      status: 422,
+      details: { faltando: [{ chave: "won_reason", rotulo: "Motivo do ganho" }] },
+    });
+    expect(db.updates).toEqual([]);
+  });
+
+  it("ganho com o motivo exigido: grava won_reason NA MESMA escrita que fecha", async () => {
+    const db = makeDb({
+      leads: [baseLead()],
+      stages: baseStages(),
+      pipelines: FUNIL_EXIGENTE,
+    });
+
+    const result = await encerraDemanda(db.client as never, ctx, {
+      leadId: LEAD,
+      desfecho: "won",
+      motivo: "Renovação",
+    });
+
+    expect(result.lead).toMatchObject({ status: "won", won_reason: "Renovação" });
+    expect(db.updates[0]).toMatchObject({ won_reason: "Renovação", stage_id: WON_STAGE });
+  });
+
+  it("motivo de ganho fora da lista do funil: 422 won_reason_invalid antes do update", async () => {
+    const db = makeDb({
+      leads: [baseLead()],
+      stages: baseStages(),
+      pipelines: FUNIL_EXIGENTE,
+    });
+
+    await expect(
+      encerraDemanda(db.client as never, ctx, {
+        leadId: LEAD,
+        desfecho: "won",
+        motivo: "Mentira comercial",
+      }),
+    ).rejects.toMatchObject({ code: "won_reason_invalid", status: 422 });
+    expect(db.updates).toEqual([]);
+  });
+
+  it("ganho SEM exigência e sem lista segue como hoje: fecha sem motivo nenhum (critério 3)", async () => {
+    const db = makeDb({
+      leads: [baseLead()],
+      stages: baseStages(),
+      pipelines: [{ id: PIPELINE, organization_id: ORG, settings: {} }],
+    });
+
+    const result = await encerraDemanda(db.client as never, ctx, {
+      leadId: LEAD,
+      desfecho: "won",
+    });
+    expect(result.lead).toMatchObject({ status: "won" });
+    expect(db.updates[0]).not.toHaveProperty("won_reason");
   });
 
   it("mantém 500 internal_error para um erro de banco que não é sobre o motivo da perda", async () => {

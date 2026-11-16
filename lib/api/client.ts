@@ -1,6 +1,10 @@
 import type { ZodSchema } from "zod";
 
 import { ApiError, type ApiErrorBody } from "@/lib/api/types";
+import { statusValeRepetir, statusValeRepetirEscrita } from "@/lib/api/retentativa";
+import { mostrarAvisoOrgDivergente } from "@/lib/auth/aviso-org-divergente";
+import { CODIGO_ORG_DIVERGENTE, HEADER_ORG_DA_ABA, orgDaAba } from "@/lib/auth/org-da-aba";
+import { CODIGO_SENHA_PROVISORIA } from "@/lib/auth/senha-provisoria";
 import { randomId } from "@/lib/random-id";
 
 type HttpMethod = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
@@ -67,7 +71,11 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const MUTATION_TIMEOUT_MS = 30_000;
 
 const MAX_ATTEMPTS = 3;
-const RETRYABLE_STATUSES = new Set([429, 503]);
+/**
+ * Os status que valem outra tentativa moram em `lib/api/retentativa.ts` — a
+ * MESMA régua que a camada de queries consulta. Aqui fica só o degrau da
+ * escada; a lista de status, não.
+ */
 const MUTATING_METHODS = new Set<HttpMethod>(["POST", "PATCH", "PUT", "DELETE"]);
 
 /**
@@ -148,6 +156,33 @@ function pedirDecisaoAoServidor(): void {
     return; // sem trava, não arrisca o laço
   }
   window.location.reload();
+}
+
+/**
+ * A EMPRESA FOI SUSPENSA COM A TELA ABERTA. Diferente de `no_active_org`, aqui
+ * o destino é um só — o hub `/account-suspended` (pagar, LGPD, trocar de
+ * empresa) —, então não há o que perguntar ao servidor: vai direto. Já no hub,
+ * não navega de novo (a trava contra o laço é o próprio endereço).
+ */
+const HUB_DA_SUSPENSAO = "/account-suspended";
+
+function irParaOHubDaSuspensao(): void {
+  if (typeof window === "undefined" || window.location.pathname === HUB_DA_SUSPENSAO) return;
+  window.location.assign(HUB_DA_SUSPENSAO);
+}
+
+/**
+ * PRIMEIRO ACESSO COM SENHA PROVISÓRIA (#3876). O servidor recusa `/api/v1`
+ * inteiro até a troca; quem ainda está com uma tela aberta recebe a recusa e
+ * vai para a tela de troca, em vez de ver um erro vermelho em cada botão. A
+ * trava contra o laço é o próprio endereço — já lá, não navega de novo.
+ */
+const TELA_DE_TROCA_DE_SENHA = "/trocar-senha";
+
+function irParaATelaDeTrocaDeSenha(): void {
+  if (typeof window === "undefined") return;
+  if (window.location.pathname === TELA_DE_TROCA_DE_SENHA) return;
+  window.location.assign(TELA_DE_TROCA_DE_SENHA);
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -247,6 +282,11 @@ async function request<T>(
 
   if (MUTATING_METHODS.has(method)) {
     headers["Idempotency-Key"] ??= opts.idempotencyKey ?? randomId();
+    // A organização DESTA aba, declarada em toda ESCRITA (#2335, metade 2).
+    // Só em método mutante: leitura não carrega o header, então a recusa do
+    // servidor (`org_divergente`) nunca alcança um GET.
+    const aba = orgDaAba();
+    if (aba?.orgId) headers[HEADER_ORG_DA_ABA] = aba.orgId;
   }
 
   const serializedBody =
@@ -295,8 +335,20 @@ async function request<T>(
         return parsed;
       }
 
-      // Retry on 429/503
-      if (RETRYABLE_STATUSES.has(res.status) && attempt < MAX_ATTEMPTS) {
+      // Repetição por STATUS: 429/502/503/504 em leitura; 429/503 em escrita.
+      //
+      // A régua mora em `lib/api/retentativa.ts` (uma só, para as duas
+      // camadas). A distinção entre leitura e escrita é sobre INCERTEZA, e já
+      // era a do repositório (`client.test.ts` t11/t11b): 429 e 503 são
+      // respostas — o servidor DISSE que não processou, repetir é seguro, e é
+      // o que segura o contrato do discador de voz. 502 e 504 vêm de um
+      // intermediário sem resposta do destino: o pedido PODE ter sido
+      // processado, e repetir uma escrita ali duplicaria a mensagem. Leitura
+      // não tem esse risco — repetir um GET é sempre seguro.
+      const valeRepetir = MUTATING_METHODS.has(method)
+        ? statusValeRepetirEscrita(res.status)
+        : statusValeRepetir(res.status);
+      if (valeRepetir && attempt < MAX_ATTEMPTS) {
         const retryAfter = parseRetryAfterSeconds(res.headers.get("Retry-After"));
         const delay = retryAfter !== null ? retryAfter * 1000 : backoffMs(attempt);
         await sleep(delay, opts.signal);
@@ -312,6 +364,29 @@ async function request<T>(
         // com erro em vez de ficar pendurado esperando uma resposta que não vem.
         if (res.status === 403 && e.code === "no_active_org") {
           pedirDecisaoAoServidor();
+        }
+        if (res.status === 403 && e.code === "org_suspended") {
+          irParaOHubDaSuspensao();
+        }
+        if (res.status === 403 && e.code === CODIGO_SENHA_PROVISORIA) {
+          irParaATelaDeTrocaDeSenha();
+        }
+        // #2335, metade 2: o servidor recusou a escrita porque a organização
+        // que ESTA aba declarou diverge do cookie `active_org`. A tela traduz
+        // o código no MESMO aviso da metade 1 (leitura) — mesma janela, mesma
+        // decisão, venha o aviso de onde vier. O `throw` de baixo continua:
+        // quem chamou precisa terminar com erro em vez de ficar pendurado.
+        if (e.code === CODIGO_ORG_DIVERGENTE) {
+          const detalhes = (e.details ?? {}) as {
+            organization_id?: string;
+            organization_name?: string;
+          };
+          const aba = orgDaAba();
+          mostrarAvisoOrgDivergente({
+            daAba: aba?.nome ?? null,
+            daSessao: detalhes.organization_name ?? detalhes.organization_id ?? null,
+            idioma: aba?.idioma ?? null,
+          });
         }
         throw new ApiError(
           res.status,
@@ -329,6 +404,7 @@ async function request<T>(
         typeof errBody === "string" && errBody.length > 0
           ? errBody
           : `HTTP ${res.status}`,
+        true,
       );
     } catch (err) {
       // ApiError thrown above for non-retryable: propagate immediately

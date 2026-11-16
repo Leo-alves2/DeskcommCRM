@@ -19,6 +19,11 @@ export interface RouterMember {
   intent_description: string;
   examples: string[];
   position: number;
+  /** Fluxo de atendimento que começa quando a intenção casa. `null` = só agente. */
+  flow_pointer_id: string | null;
+  /** Funil de DESTINO do card quando a intenção casa (#2155). `null` = só roteia. */
+  pipeline_id: string | null;
+  stage_id: string | null;
 }
 
 export interface RouterMemberInput {
@@ -26,6 +31,10 @@ export interface RouterMemberInput {
   intent_name: string;
   intent_description: string;
   examples: string[];
+  flow_pointer_id: string | null;
+  /** Funil de DESTINO do card quando a intenção casa (#2155). `null` = só roteia. */
+  pipeline_id: string | null;
+  stage_id: string | null;
 }
 
 export interface RouterDetail {
@@ -35,6 +44,8 @@ export interface RouterDetail {
   is_active: boolean;
   config: Record<string, unknown>;
   fallback_agent_id: string | null;
+  /** #4363 — a frase do cliente na troca automática. `null` = desligada. */
+  passagem_ao_cliente: string | null;
 }
 
 export interface RouterDetailState {
@@ -43,6 +54,8 @@ export interface RouterDetailState {
 }
 
 export interface RouterTestResult {
+  ia_consultada?: boolean;
+  modo_roteador?: "comparacao" | "sob_demanda";
   intent_name: string | null;
   /**
    * `null` quando NÃO houve veredito — não é zero. O tipo importa mais que a
@@ -53,6 +66,21 @@ export interface RouterTestResult {
   min_confidence: number;
   agent_id: string | null;
   agent_name: string | null;
+  /**
+   * O Jev na mesma frase, quando a tarefa do roteador dele roda. `null` com ela
+   * desligada; ausente na resposta da imagem anterior.
+   */
+  jev?: {
+    estado: "observando" | "decidindo";
+    respondeu: boolean;
+    intent_name: string | null;
+    /** A probabilidade da escolha dele; `null` quando ele não respondeu. */
+    confidence: number | null;
+    agent_id: string | null;
+    agent_name: string | null;
+    /** Em produção valeria a escolha dele, conforme o modo de roteamento salvo. */
+    decide: boolean;
+  } | null;
 }
 
 export interface CreateRouterInput {
@@ -65,6 +93,17 @@ export interface UpdateRouterInput {
   name?: string;
   is_active?: boolean;
   fallback_agent_id?: string | null;
+  /**
+   * #4340 — leva o roteador INTEIRO para o número novo. A rota só aceita quando
+   * o número atual está arquivado e o destino está vivo e sem roteador; a
+   * mudança sai auditada ("de X para Y").
+   */
+  channel_session_id?: string;
+  /**
+   * #4363 — a frase que o CLIENTE lê quando o roteador troca de agente
+   * automaticamente. `null` = desligada (o padrão, e o comportamento de antes).
+   */
+  passagem_ao_cliente?: string | null;
   /** Mesclada com a config existente pelo PATCH — mandar um campo não apaga os outros. */
   config?: Record<string, unknown>;
 }
@@ -84,11 +123,59 @@ export function useRouters(initial?: { routers: RouterListItem[] }) {
 export function useRouter(id: string, initial?: RouterDetailState) {
   return useQuery({
     queryKey: detailKey(id),
-    ...(initial !== undefined ? { initialData: initial } : {}),
+    // #2569 — `placeholderData`, não `initialData`: o snapshot do SSR é o
+    // estado ENQUANTO a busca não volta, não o estado final. Com `initialData`
+    // o React Query grava `dataUpdatedAt = Date.now()` (query-core, `query.ts`),
+    // o `staleTime` de 30 s de `makeQueryClient()` o deixa fresco e
+    // `shouldFetchOnMount` (`queryObserver.ts`) volta falso — o
+    // `GET /api/v1/ai/routers/<id>` NUNCA acontecia ao abrir o editor, a
+    // reidratação do `draftMembers` (que só dispara quando `members` muda)
+    // ficava sem efeito e o seletor ficava em "Sem destino" para sempre, com a
+    // API devolvendo o `pipeline_id` que ninguém pedia. O placeholder não entra
+    // no cache: o que fica guardado é sempre a resposta da API.
+    ...(initial !== undefined ? { placeholderData: initial } : {}),
     queryFn: () =>
       apiClient
         .get<{ data: RouterDetailState }>(`/api/v1/ai/routers/${encodeURIComponent(id)}`)
         .then((r) => r.data),
+  });
+}
+
+/** Uma etapa do funil, no recorte que o seletor de destino do roteador usa. */
+export interface EstagioDoFunil {
+  id: string;
+  name: string;
+  /** Etapa de fechamento: nenhum card NASCE em Ganho/Perdido. */
+  is_won: boolean;
+  is_lost: boolean;
+}
+
+/**
+ * #2569 — as etapas de UM funil, para o seletor "Etapa de destino" do roteador.
+ *
+ * Rota LEVE (`/api/v1/pipelines/<id>/stages`) de propósito. A porta vizinha,
+ * `usePipelineStages` (hooks/webhooks/useWebhookSources.ts), lê o QUADRO inteiro
+ * (`/board`): leads abertos, anexos, tarefas e a próxima ação de cada card. O
+ * editor do roteador só precisa dos nomes das colunas — e, enquanto o quadro não
+ * voltava, o seletor de etapa não existia na tela (metade do relato da issue);
+ * se aquela resposta falhasse, ele não aparecia nunca. Aqui a pergunta é a
+ * mesma, e a resposta é só ela.
+ *
+ * Etapa fechada fica de fora: o card nasce na etapa escolhida, e card não nasce
+ * em Ganho/Perdido (mesma regra de `lib/followup`, que recusa destino em etapa
+ * de fechamento).
+ */
+export function useEstagiosDoFunil(pipelineId: string | null) {
+  return useQuery({
+    queryKey: ["roteador-estagios-do-funil", pipelineId],
+    enabled: !!pipelineId,
+    staleTime: 60_000,
+    queryFn: async () => {
+      const res = await apiClient.get<{ data: EstagioDoFunil[] }>(
+        `/api/v1/pipelines/${encodeURIComponent(pipelineId as string)}/stages`,
+      );
+      return (res.data ?? []).filter((e) => !e.is_won && !e.is_lost);
+    },
   });
 }
 

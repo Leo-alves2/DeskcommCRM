@@ -26,6 +26,8 @@ interface AgendamentoListado {
   donoId: string | null;
   contatoId: string | null;
   contatoNome: string | null;
+  convidadosDaEquipe?: string[];
+  tipo?: { id: string } | null;
 }
 
 export interface RecorteDaGrade {
@@ -40,11 +42,11 @@ export interface RecorteDaGrade {
  *
  * ## Por que `de`/`ate` e NUNCA `dia`
  *
- * A rota também aceita `dia=YYYY-MM-DD`, e ele corta em **UTC**. Medido pelo
- * autor enquanto escrevia: para America/Sao_Paulo, pedir o dia 12 devolve de
- * 11/03 21:00 a 12/03 20:59 na parede de quem olha — três horas do dia anterior
- * ENTRAM, e as três últimas do dia pedido FICAM DE FORA. Um compromisso das 22h
- * some da lista do próprio dia.
+ * A rota também aceita `dia=YYYY-MM-DD`, e ele corta no fuso da **organização**
+ * (desde a #1744; sem fuso legível, em UTC). Esse não é necessariamente o fuso
+ * de APRESENTAÇÃO de quem olha — e, antes da #1744, o corte era em UTC: para
+ * America/Sao_Paulo o dia 12 pegava três horas do dia 11 e perdia as três
+ * últimas do 12.
  *
  * Mandando INSTANTE, quem calcula o começo e o fim é a tela, no fuso de
  * APRESENTAÇÃO — o mesmo `AuthUser.timezone` que a página já resolve. A rota não
@@ -81,6 +83,8 @@ export function useAgendamentos(recorte: RecorteDaGrade | null) {
           revision:a.revision,
           titulo: a.titulo,
           responsavelId: a.donoId ?? "",
+          convidadosDaEquipe: a.convidadosDaEquipe,
+          tipoId: a.tipo?.id ?? null,
           comeca: a.iniciaEm,
           termina: a.terminaEm,
           // A origem vem da ROTA, e não é mais carimbada aqui.

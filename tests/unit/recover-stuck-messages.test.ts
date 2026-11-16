@@ -78,6 +78,12 @@ function clientDuble(presas: Record<string, unknown>[], atualizadas?: Record<str
           filtros[`lt:${col}`] = val;
           return cadeia;
         },
+        gte() {
+          return cadeia;
+        },
+        order() {
+          return cadeia;
+        },
         limit() {
           chamadas.push({ tabela, op, filtros, valores });
           return Promise.resolve({ data: presas, error: null });
@@ -102,8 +108,11 @@ function presa(over: Partial<Record<string, string>> = {}) {
     id: "11111111-1111-4111-8111-111111111111",
     organization_id: "22222222-2222-4222-8222-222222222222",
     conversation_id: "33333333-3333-4333-8333-333333333333",
+    contact_id: "44444444-4444-4444-8444-444444444444",
     created_at: new Date(AGORA.getTime() - 10 * 60 * 1000).toISOString(),
     sent_via: "ai",
+    // Embed N:1: o PostgREST devolve OBJETO.
+    contacts: { phone_number: "+5531999990000" },
     ...over,
   };
 }
@@ -135,7 +144,7 @@ describe("recover-stuck-messages", () => {
     const { client, chamadas } = clientDuble([]);
     const r = await recoverStuckMessages(client as never, AGORA, "req-2");
 
-    expect(r).toEqual({ scanned: 0, failed: 0, organizations: 0 });
+    expect(r).toEqual({ scanned: 0, failed: 0, organizations: 0, esperando: 0 });
     expect(chamadas.filter((c) => c.op !== "select")).toEqual([]);
   });
 
@@ -171,7 +180,7 @@ describe("recover-stuck-messages", () => {
     expect(avisos[0]?.valores?.kind).toBe("message_send_stuck");
     expect(avisos[0]?.valores?.severity).toBe("critical");
     expect(String(avisos[0]?.valores?.title)).toContain("3");
-    expect(r).toEqual({ scanned: 3, failed: 3, organizations: 1 });
+    expect(r).toEqual({ scanned: 3, failed: 3, organizations: 1, esperando: 0 });
   });
 
   it("emite message.failed por mensagem marcada (W-12)", async () => {
@@ -194,6 +203,28 @@ describe("recover-stuck-messages", () => {
     );
   });
 
+  it("o message.failed do timeout tem o MESMO contrato do envio e do webhook da Meta (#1614)", async () => {
+    // Um formato só para quem integra: a regra "Quando uma mensagem não for
+    // entregue" com `event.erro.codigo` precisa casar no timeout também, e o
+    // `contact_id` é de onde o motor hidrata `contact.*` nas condições.
+    const { client, chamadas } = clientDuble([presa()]);
+    await recoverStuckMessages(client as never, AGORA, "req-7");
+
+    const [evento] = chamadas.filter((c) => c.tabela === "rpc:emit_event");
+    expect(evento?.valores).toMatchObject({
+      p_entity_kind: "message",
+      p_payload: {
+        message_id: presa().id,
+        conversation_id: presa().conversation_id,
+        contact_id: presa().contact_id,
+        contact: "+5531999990000",
+        sent_via: "ai",
+        erro: { codigo: "send_timeout", titulo: expect.stringContaining("5 min") },
+      },
+      p_metadata: { source: "recover-stuck-messages", request_id: "req-7" },
+    });
+  });
+
   it("o UPDATE que não pegou nada não vira evento nem aviso (a corrida perdida é silenciosa)", async () => {
     // presas encontradas, mas o UPDATE devolve zero linhas: outro tick — ou o
     // ack — chegou primeiro. Anunciar aqui assustaria o dono do negócio com uma
@@ -203,6 +234,6 @@ describe("recover-stuck-messages", () => {
 
     expect(chamadas.filter((c) => c.tabela === "agent_inbox_items")).toEqual([]);
     expect(chamadas.filter((c) => c.tabela === "rpc:emit_event")).toEqual([]);
-    expect(r).toEqual({ scanned: 1, failed: 0, organizations: 0 });
+    expect(r).toEqual({ scanned: 1, failed: 0, organizations: 0, esperando: 0 });
   });
 });

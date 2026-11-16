@@ -7,6 +7,11 @@ import {
   sincronizaEstagioDoAgente,
   type EstagioCandidato,
 } from "@/lib/leads/agent-stage-sync";
+import {
+  avisoDoEspelhoRecusado,
+  MIRROR_WARN_ONLY,
+  mirrorLeadStageToCrm,
+} from "@/lib/agent-engine/edge/crm/move-lead-stage";
 
 vi.mock("@/lib/leads/activity-emitter", async (orig) => ({
   ...(await orig<typeof import("@/lib/leads/activity-emitter")>()),
@@ -106,11 +111,17 @@ describe("resolveDestinoDoAgente", () => {
  */
 type Resposta = { data: unknown; error: { message: string } | null };
 interface Cenario {
+  /** Os `update` em `crm_leads`, na ordem (#3461: a posição de entrada). */
+  escritas?: unknown[];
+  /** O primeiro card da etapa de destino, lido para pôr o que chega no topo. */
+  topo?: Resposta;
   leads: Resposta;
   stages: Resposta;
   update: Resposta;
   /** Erro devolvido pelo `emit_event` — o rastro pode falhar sem desfazer o movimento. */
   rpcError?: { message: string } | null;
+  /** O `crm_pipelines.settings` que a régua de campos obrigatórios lê (#1536). */
+  funil?: Resposta;
 }
 
 const ORG = "org-1";
@@ -157,16 +168,31 @@ function fakeAdmin(c: Cenario, rpcs: ChamadaRpc[] = []) {
       const b = {
         _update: false,
         _select: false,
+        _topo: false,
         select: () => {
           b._select = true;
           return b;
         },
-        update: () => {
+        update: (payload?: unknown) => {
           b._update = true;
+          if (tabela === "crm_leads") c.escritas?.push(payload);
           return b;
         },
+        // A leitura do topo da etapa de destino (#3461): `.order().limit()`.
+        order: () => {
+          b._topo = true;
+          return b;
+        },
+        limit: () => b,
         eq: () => b,
-        maybeSingle: () => Promise.resolve({ data: { name: "Primeiro contato" }, error: null }),
+        maybeSingle: () =>
+          Promise.resolve(
+            tabela === "crm_leads" && b._topo
+              ? (c.topo ?? { data: null, error: null })
+              : tabela === "crm_pipelines"
+              ? (c.funil ?? { data: { name: "Funil" }, error: null })
+              : { data: { name: "Primeiro contato" }, error: null },
+          ),
         then(onF: (v: unknown) => unknown, onR?: (e: unknown) => unknown) {
           const r = b._update
             ? b._select
@@ -205,6 +231,18 @@ describe("sincronizaEstagioDoAgente", () => {
     const r = await sincroniza(cenario());
     expect(r).toMatchObject({ moveu: true, motivo: "movido", stageName: "Proposta enviada" });
     expect(vi.mocked(emitLeadActivity)).toHaveBeenCalledTimes(1);
+  });
+
+  it("o card CHEGA no topo da etapa de destino (#3461), e a leitura que falha não desfaz o move", async () => {
+    const escritas: unknown[] = [];
+    await sincroniza(cenario({ escritas, topo: { data: { position_in_stage: 2000 }, error: null } }));
+    expect(escritas).toEqual([expect.objectContaining({ position_in_stage: 1000 })]);
+
+    const semLeitura: unknown[] = [];
+    const r = await sincroniza(cenario({ escritas: semLeitura, topo: { data: null, error: { message: "fetch failed" } } }));
+    expect(r).toMatchObject({ moveu: true });
+    expect(semLeitura).toHaveLength(1);
+    expect(semLeitura[0]).not.toHaveProperty("position_in_stage");
   });
 
   it("SELECT de leads com erro é INDISPONIBILIDADE, não 'sem_negocio'", async () => {
@@ -296,5 +334,99 @@ describe("sincronizaEstagioDoAgente — o evento que aciona automação e follow
   it("o rastro pode falhar sem desfazer o movimento — o card andou, e isso não se retira", async () => {
     const { r } = await sincronizaObservando(cenario({ rpcError: { message: "event_log indisponível" } }));
     expect(r).toMatchObject({ moveu: true, motivo: "movido" });
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * A RÉGUA DE CAMPOS OBRIGATÓRIOS NO CAMINHO DO ASSISTENTE (CR do mantenedor, #1536).
+ *
+ * `agent-stage-sync.ts` grava `stage_id` direto — sem a pergunta aqui, o
+ * assistente seria o ÚNICO caminho do produto que move sem passar por
+ * `validaCamposExigidos`. O padrão testado é o MESMO da perda (#917) no
+ * próprio arquivo: não move, devolve o motivo e deixa o rastro (o espelho abre
+ * item de inbox com o que falta).
+ *
+ * `obrigatorio_em.etapas` é `z.string().uuid()` e `camposDoFunil` DESCARTA o
+ * campo quando o id não é UUID — por isso a etapa de destino deste cenário é
+ * um UUID, como na instalação real (os `s1`/`s2` dos dublês de cima não
+ * passariam do parse e a recusa nunca acenderia).
+ */
+describe("o assistente move pela MESMA régua dos outros caminhos (#1536)", () => {
+  beforeEach(() => vi.mocked(emitLeadActivity).mockClear());
+
+  const ETAPA_UUID = "99999999-9999-4999-8999-999999999999";
+  const stagesComUuid = STAGES.map((s) => (s.id === "s2" ? { ...s, id: ETAPA_UUID } : s));
+  const cenarioExigente = () =>
+    cenario({
+      stages: { data: stagesComUuid, error: null },
+      funil: {
+        data: {
+          settings: {
+            fields: [
+              {
+                key: "concorrente",
+                label: "Concorrente",
+                type: "text",
+                obrigatorio_em: { etapas: [ETAPA_UUID] },
+              },
+            ],
+          },
+        },
+        error: null,
+      },
+    });
+
+  it("não move: devolve `campos_obrigatorios` com o que falta, e NADA é escrito", async () => {
+    const { r, eventos } = await sincronizaObservando(cenarioExigente());
+
+    expect(r).toMatchObject({ moveu: false, motivo: "campos_obrigatorios" });
+    expect(r.detalhe).toContain("Concorrente");
+    // Nem atividade na timeline nem evento: o card ficou onde estava.
+    expect(vi.mocked(emitLeadActivity)).not.toHaveBeenCalled();
+    expect(eventos).toHaveLength(0);
+  });
+
+  it("funil SEM a exigência continua movendo — a recusa não virou bloqueio geral", async () => {
+    const { r } = await sincronizaObservando(
+      cenario({ stages: { data: stagesComUuid, error: null } }),
+    );
+    expect(r).toMatchObject({ moveu: true, motivo: "movido" });
+    expect(vi.mocked(emitLeadActivity)).toHaveBeenCalledTimes(1);
+  });
+
+  it("o espelho vira aviso ACIONÁVEL: não é warn-only nem incidente", () => {
+    expect(MIRROR_WARN_ONLY.has("campos_obrigatorios" as never)).toBe(false);
+
+    const aviso = avisoDoEspelhoRecusado({
+      motivo: "campos_obrigatorios",
+      detalhe: "Preencha os campos obrigatórios antes de continuar: Concorrente.",
+      etapaDeDestino: "negotiating",
+      etapaDoFunil: "Proposta enviada",
+    });
+
+    expect(aviso).not.toBeNull();
+    expect(aviso!.body).toContain("Concorrente");
+    expect(aviso!.body).toContain("Proposta enviada");
+    // Nada quebrou: não é o aviso de incidente.
+    expect(aviso!.body).not.toContain("Reconcilie");
+    expect(aviso!.dedupe).toBe("kind_ref_e_titulo");
+  });
+
+  it("a passagem pelo espelho traduz o motivo — não cai no `motivo não traduzido`", async () => {
+    const sync = vi.fn(async () => ({
+      moveu: false as const,
+      motivo: "campos_obrigatorios" as const,
+      detalhe: "Preencha os campos obrigatórios antes de continuar: Concorrente.",
+    }));
+    const r = await mirrorLeadStageToCrm(
+      {} as never,
+      { supabase: {} as never } as never,
+      { tenantId: "org", leadId: "contato", toStage: "negotiating" as never },
+      { sync: sync as never },
+    );
+    expect(r.ok ? null : r.reason).toBe("campos_obrigatorios");
+    expect(r.ok ? null : r.detail).toContain("Concorrente");
   });
 });

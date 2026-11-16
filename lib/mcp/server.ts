@@ -12,10 +12,16 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { z } from "zod";
 
+import type { ModuloOpcional } from "@/lib/instalacao/modulos";
+import type { CapacidadeDaOrganizacao } from "@/lib/organizacao/capacidades";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { auditMcpToolCall } from "./audit";
-import { ensureRole, ensureScope, type McpAuthResult } from "./auth";
+import { McpAuthError, ensureRole, ensureScope, type McpAuthResult } from "./auth";
+import { recusaDaChamada, rotuloDaRecusa } from "./desfecho-da-chamada";
+import { verificarTetoMcp } from "./rate-limit";
+import { tamanhoDoResultado } from "./resultado-bytes";
 import { allTools } from "./tools";
+import { deCapacidadeDesligada, deModuloDesligado } from "./tools/catalog";
 import { higienizarUuidsDeAterro } from "./uuid-de-aterro";
 import type { McpContext } from "./types";
 
@@ -32,7 +38,18 @@ function summarizeResult(result: unknown): string | undefined {
   return undefined;
 }
 
-export function createMcpServer(auth: McpAuthResult, requestId: string): McpServer {
+/**
+ * `modulosLigados`: os módulos opcionais ligados na instalação. Capacidade de
+ * módulo desligado nem é registrada — o cliente externo não a vê na lista.
+ * Ausente vale como nenhum, pela mesma razão de `pickToolsFromMcp`.
+ */
+export function createMcpServer(
+  auth: McpAuthResult,
+  requestId: string,
+  modulosLigados: readonly ModuloOpcional[] = [],
+  capacidadesLigadas: readonly CapacidadeDaOrganizacao[] = [],
+  idempotencyKey?: string,
+): McpServer {
   const server = new McpServer({
     name: SERVER_NAME,
     version: SERVER_VERSION,
@@ -41,6 +58,8 @@ export function createMcpServer(auth: McpAuthResult, requestId: string): McpServ
   const supabase = createAdminClient();
 
   for (const tool of allTools) {
+    if (deModuloDesligado(tool.name, modulosLigados)) continue;
+    if (deCapacidadeDesligada(tool.name, capacidadesLigadas)) continue;
     server.registerTool(
       tool.name,
       {
@@ -60,16 +79,35 @@ export function createMcpServer(auth: McpAuthResult, requestId: string): McpServ
           (rawArgs ?? {}) as Record<string, unknown>,
         );
         const args = higiene.limpos;
+        const argsAudit = tool.redigirParaAuditoria ? tool.redigirParaAuditoria(args) : args;
         const ctx: McpContext = {
+          ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
           organizationId: auth.organizationId,
           role: auth.role,
           actor: auth.actor,
           apiTokenId: auth.apiTokenId,
+          tokenScopes: auth.scopes,
           requestId,
           supabase,
         };
 
         try {
+          // ANTES de escopo e papel: quem está em laço estourando o teto não
+          // deve pagar o custo de mais nada. Dentro do `try` de propósito — o
+          // `catch` abaixo é quem AUDITA, e recusa sem rastro em
+          // `api_audit_log` faria "o agente parou" virar mistério.
+          await verificarTetoMcp(auth, tool.category);
+          // Empresa suspensa: só a privacidade responde (LGPD nunca é
+          // bloqueada). Depois do teto — a integração em laço não escreve
+          // auditoria sem freio — e antes de tudo que custa.
+          if (auth.orgSuspensa && !tool.permiteOrgSuspensa) {
+            throw new McpAuthError(
+              -32002,
+              403,
+              "Organization suspended: only privacy (LGPD) tools answer until the account is reactivated.",
+              "org_suspended",
+            );
+          }
           ensureScope(auth.scopes, tool.requiresScope);
           ensureRole(auth.role, tool.requiresRole);
 
@@ -80,16 +118,34 @@ export function createMcpServer(auth: McpAuthResult, requestId: string): McpServ
           // sem achado era `success: true` por aqui e `false` por lá.
           const motivoDoVazio = tool.motivoDoVazio?.(result) ?? null;
 
+          // RECUSA TAMBÉM NÃO É SUCESSO (#4343). Medido na prova do #3328:
+          // `crm_create_lead` recusou com `{ erro: "sem_destino" }`, nenhum
+          // negócio nasceu, e esta linha gravava `success: true` — a trilha
+          // afirmava uma mutação que não aconteceu. A régua é a mesma dos
+          // outros dois ingressos (`lib/mcp/desfecho-da-chamada.ts`), não uma
+          // lista de ferramentas: qualquer recusa no formato do catálogo conta.
+          const recusa = recusaDaChamada(result);
+
           await auditMcpToolCall({
             ctx,
             toolName: tool.name,
-            args,
+            args: argsAudit,
             durationMs,
-            success: motivoDoVazio === null,
+            success: motivoDoVazio === null && recusa === null,
             resultSummary: summarizeResult(result),
-            ...(motivoDoVazio === null
-              ? {}
-              : { desfecho: "sem_resultado" as const, motivo: motivoDoVazio }),
+            // Mede o texto de `content` (o que a ferramenta devolve ao modelo). O `structuredContent`,
+            // mais abaixo, leva o mesmo objeto para o cliente que prefere dado estruturado e NÃO entra
+            // nesta medida: um cliente que lê os dois campos recebe cerca do dobro do que a coluna diz.
+            resultBytes: tamanhoDoResultado(result),
+            ...(recusa !== null
+              ? {
+                  errorMessage: rotuloDaRecusa(recusa),
+                  desfecho: "recusa" as const,
+                  ...(recusa.codigo === null ? {} : { motivo: recusa.codigo }),
+                }
+              : motivoDoVazio === null
+                ? {}
+                : { desfecho: "sem_resultado" as const, motivo: motivoDoVazio }),
           });
 
           return {
@@ -103,7 +159,7 @@ export function createMcpServer(auth: McpAuthResult, requestId: string): McpServ
           await auditMcpToolCall({
             ctx,
             toolName: tool.name,
-            args,
+            args: argsAudit,
             durationMs,
             success: false,
             errorMessage: message,

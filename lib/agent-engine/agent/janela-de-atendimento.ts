@@ -153,3 +153,112 @@ export function msAteAJanelaAbrir(janela: JanelaDeAtendimento, agora: Date): num
 
   return null; // inalcançável com weekdays não-vazio; falha aberta por precaução
 }
+
+/**
+ * Início do PERÍODO FECHADO vigente — o instante em que a janela passou de
+ * aberta para fechada, o mais recente que já aconteceu (#1926).
+ *
+ * É a régua de "uma vez por contato por período fechado": o aviso de fora do
+ * horário só vale de novo quando a janela ABRIU e FECHOU outra vez. Sem esta
+ * função o critério viraria "desde a última mensagem", que não é período nenhum
+ * — quem escreve às 22h01 receberia outro aviso às 22h40.
+ *
+ * A conta é em minutos de relógio de parede, como `msAteAJanelaAbrir`: o Brasil
+ * não tem DST hoje e o job reavalia a cada turno, então uma virada de horário
+ * desloca o alvo em no máximo 1h em vez de pular o período.
+ *
+ * `null` = não deu para determinar (fuso/torto/sem candidato em 8 dias) — quem
+ * chama NÃO envia aviso, porque sem régua não dá para prometer "só uma vez".
+ */
+export function inicioDoPeriodoFechado(janela: JanelaDeAtendimento, agora: Date): Date | null {
+  let local: { dia: number; minutos: number };
+  try {
+    local = relogioLocal(janela.timezone, agora);
+  } catch {
+    return null; // falha aberta: sem relógio local não há período
+  }
+
+  const fim = minutosDe(janela.end);
+  if (fim === null) return null;
+
+  // Volta até 8 dias (um ciclo inteiro + 1) procurando o último dia da janela
+  // cujo FECHAMENTO (end) já passou. `minutosDesdeOFechamento < 0` no primeiro
+  // candidato = a janela fecha HOJE mais tarde (ou ainda não abriu hoje).
+  for (let voltas = 0; voltas <= 7; voltas += 1) {
+    const dia = (local.dia - voltas + 14) % 7;
+    if (!janela.weekdays.includes(dia)) continue;
+    const minutosDesdeOFechamento = local.minutos - fim + voltas * 24 * 60;
+    if (minutosDesdeOFechamento < 0) continue;
+    // Base no MINUTO cheio: `relogioLocal` conta minutos inteiros, e somar isso
+    // a um `agora` com segundos fazia o início herdar os segundos — a chave do
+    // aviso mudava a cada mensagem e o "uma vez por período" nunca casava.
+    const agoraNoMinuto = Math.floor(agora.getTime() / 60_000) * 60_000;
+    return new Date(agoraNoMinuto - minutosDesdeOFechamento * 60_000);
+  }
+
+  return null;
+}
+
+/**
+ * "Não atender em feriado nacional" (#3877, doc de decisão 316, alternativa A):
+ * `trigger_config.filters.business_hours.fechado_em_feriado_nacional`.
+ *
+ * DESLIGADA de fábrica: só `=== true` liga. Chave ausente, de outro tipo ou sem
+ * `business_hours` ⇒ `false`, e o feriado é um dia comum da janela semanal —
+ * exatamente o comportamento de antes da opção existir. Muita operação atende
+ * em feriado (delivery, plantão, loja de shopping); calar o agente delas por
+ * padrão seria a mordaça que este arquivo não pode criar.
+ */
+export function lerFechadoEmFeriadoNacional(triggerConfig: unknown): boolean {
+  if (typeof triggerConfig !== 'object' || triggerConfig === null) return false;
+  const filters = (triggerConfig as { filters?: unknown }).filters;
+  if (typeof filters !== 'object' || filters === null) return false;
+  const bh = (filters as { business_hours?: unknown }).business_hours;
+  if (typeof bh !== 'object' || bh === null) return false;
+  return (bh as { fechado_em_feriado_nacional?: unknown }).fechado_em_feriado_nacional === true;
+}
+
+/**
+ * Como `msAteAJanelaAbrir`, mas uma abertura que cai em FERIADO não conta: o
+ * turno espera a abertura do próximo dia da janela que não seja feriado.
+ *
+ * `ehFeriado` recebe um INSTANTE e responde pelo dia civil dele — quem chama
+ * escolhe a régua (no turno: `ehFeriadoNacionalNoFuso` no fuso da janela). A
+ * função continua pura e testável com relógio fixo.
+ *
+ * Dentro da janela num feriado ⇒ espera até a próxima abertura que não é
+ * feriado (nunca `null`). Fora de feriado ⇒ idêntica a `msAteAJanelaAbrir`.
+ *
+ * ponytail: salta de abertura em abertura, no máximo 31 vezes (feriados
+ * nacionais seguidos são no máximo dois — segunda e terça de Carnaval). Sem
+ * achar dia útil em 31 aberturas, falha ABERTA para a janela semanal pura.
+ */
+export function msAteAJanelaAbrirPulandoFeriado(
+  janela: JanelaDeAtendimento,
+  agora: Date,
+  ehFeriado: (instante: Date) => boolean,
+): number | null {
+  const semFeriado = msAteAJanelaAbrir(janela, agora);
+  const fim = minutosDe(janela.end);
+  if (fim === null) return semFeriado;
+
+  let referencia = agora;
+  for (let tentativas = 0; tentativas < 31; tentativas += 1) {
+    const espera = msAteAJanelaAbrir(janela, referencia);
+    const abertura = espera === null ? referencia : new Date(referencia.getTime() + espera);
+    if (!ehFeriado(abertura)) {
+      const ms = abertura.getTime() - agora.getTime();
+      return ms > 0 ? ms : null;
+    }
+    // A abertura é num feriado: o próximo candidato vem depois do FECHAMENTO
+    // da janela daquele dia (o `end` no relógio local da janela).
+    let local: { dia: number; minutos: number };
+    try {
+      local = relogioLocal(janela.timezone, abertura);
+    } catch {
+      return semFeriado; // falha aberta
+    }
+    referencia = new Date(abertura.getTime() + (fim - local.minutos) * 60_000);
+  }
+  return semFeriado;
+}

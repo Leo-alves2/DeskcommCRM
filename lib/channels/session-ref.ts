@@ -14,7 +14,14 @@
 export type ChannelSessionRef =
   | { provider: "waha"; waha_session_name: string }
   | { provider: "meta_cloud"; meta_phone_number_id: string }
-  | { provider: "zernio" | "zernio_social"; zernio_account_id: string };
+  | { provider: "zernio" | "zernio_social"; zernio_account_id: string }
+  | { provider: "datafy"; datafy_phone_number_id: string }
+  /**
+   * Bot do Telegram (#3440): o id do robô é o que identifica o canal no
+   * provider — o token (que também o identificaria) é segredo cifrado e não
+   * pode virar `sessionRef`, que atravessa log, URL de webhook e métrica.
+   */
+  | { provider: "telegram"; telegram_bot_id: string };
 
 /**
  * Colunas que um `select` do PostgREST precisa trazer para `resolveSessionRef`
@@ -22,14 +29,22 @@ export type ChannelSessionRef =
  * nomeia coluna de provider, e ela some da feature junto com a decisão.
  */
 export const CHANNEL_SESSION_REF_COLUMNS =
-  "provider, waha_session_name, meta_phone_number_id, zernio_account_id";
+  "provider, waha_session_name, meta_phone_number_id, zernio_account_id, datafy_phone_number_id, telegram_bot_id";
 
 export function resolveSessionRef(session: ChannelSessionRef): string {
   switch (session.provider) {
     case "meta_cloud":
       return session.meta_phone_number_id;
+    // O `phone_number_id` da WABA, como no canal oficial — mas pela coluna do
+    // parceiro, porque os dois podem conviver e endereçam servidores diferentes.
+    case "datafy":
+      return session.datafy_phone_number_id;
     case "waha":
       return session.waha_session_name;
+    // O bot do Telegram não endereça por telefone: o id do robô é a chave que a
+    // Bot API conhece e que a sessão guarda (migration 9342).
+    case "telegram":
+      return session.telegram_bot_id;
     // O `accountId` que o provider devolve ao conectar a WABA. NÃO é o
     // phone_number_id da Meta: quem intermedeia guarda o número por dentro e
     // endereça pelo id dele. Mandar o id da Meta aqui responde 404.

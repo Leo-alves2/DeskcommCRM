@@ -42,6 +42,12 @@ const CHAMADO = "33333333-3333-4333-8333-333333333333";
 const ANA = "11111111-1111-4111-8111-111111111111";
 const BRUNO = "99999999-9999-4999-8999-999999999999";
 
+/** Nomes vêm do `user_metadata.full_name` — é o único dado de usuário exposto (LGPD). */
+const NOMES_DE_USUARIO: Record<string, string> = {
+  [ANA]: "Ana Souza",
+  [BRUNO]: "Bruno Lima",
+};
+
 interface Consulta {
   tabela: string;
   terminal: "maybeSingle" | "then";
@@ -66,7 +72,35 @@ function fazerSupabase(resolve: Resolver) {
     };
     return chain;
   };
-  return { from, rpc: () => Promise.resolve({ data: [{ id: CONV }], error: null }) };
+  return {
+    from,
+    // O NOME agora vem de UMA consulta a `fn_nomes_dos_membros` (#4326, fatia
+    // 3): a função filtra pelo vínculo com a org pedida, como o banco.
+    rpc: (funcao: string, args: { p_org: string; p_ids: string[] }) => {
+      if (funcao === "fn_nomes_dos_membros") {
+        const daOrg = args.p_org === ORG ? Object.keys(NOMES_DE_USUARIO) : [];
+        return Promise.resolve({
+          data: args.p_ids
+            .filter((id) => daOrg.includes(id))
+            .map((id) => ({ user_id: id, full_name: NOMES_DE_USUARIO[id] ?? null, email: null })),
+          error: null,
+        });
+      }
+      return Promise.resolve({ data: [{ id: CONV }], error: null });
+    },
+    // O lookup de NOME (issue #1539) fala com o endpoint admin do GoTrue. O
+    // dublê responde com o full_name de `NOMES_DE_USUARIO` — é isso que faz o
+    // `nome` da linha ser aferível, e não um null silencioso do catch.
+    auth: {
+      admin: {
+        getUserById: (id: string) =>
+          Promise.resolve({
+            data: { user: { id, user_metadata: { full_name: NOMES_DE_USUARIO[id] ?? null } } },
+            error: null,
+          }),
+      },
+    },
+  };
 }
 
 /**
@@ -205,6 +239,21 @@ describe("crm_list_available_attendants", () => {
     for (const a of res.attendants) {
       expect(Object.keys(a)).not.toContain("email");
       expect(Object.keys(a)).not.toContain("phone");
+    }
+  });
+
+  it("cada linha traz `nome` — a regra de roteamento se escreve por gente, não por UUID (#1539)", async () => {
+    const res = (await crmListAvailableAttendants.handler(
+      { only_available: false },
+      fazerCtx(equipe),
+    )) as { attendants: Array<{ user_id: string; nome: string | null }> };
+
+    const porId = new Map(res.attendants.map((a) => [a.user_id, a.nome]));
+    expect(porId.get(ANA)).toBe("Ana Souza");
+    expect(porId.get(BRUNO)).toBe("Bruno Lima");
+    // O nome vem SÓ de full_name: nenhum campo de e-mail viaja junto (LGPD).
+    for (const a of res.attendants) {
+      expect(Object.keys(a)).not.toContain("email");
     }
   });
 

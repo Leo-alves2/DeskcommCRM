@@ -48,11 +48,14 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 
 import { ok, fail } from "@/lib/api/wrappers";
+import { patchDeExpiracao } from "@/lib/agenda/patch-de-expiracao";
 import { audit } from "@/lib/audit";
-import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import { agendaSettingsSchema } from "@/lib/schemas/settings";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { aposVagaLiberada, varrerOfertasVencidas } from "@/lib/agenda/encaixe-supabase";
+import { autorizaCron } from "@/lib/auth/cron-auth";
+import { AUTORIDADE_LOCAL } from "@/lib/agenda/autoridade";
 
 export const dynamic = "force-dynamic";
 
@@ -62,15 +65,16 @@ const LIMITE_DA_VARREDURA = 500;
 async function handle(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
-  const auth = req.headers.get("authorization") ?? "";
-  const fornecido = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
-  const aceitos = [env.INTERNAL_CRON_SECRET, env.INTERNAL_SECRET].filter(Boolean);
-  if (aceitos.length === 0 || !fornecido || !aceitos.includes(fornecido)) {
+  if (!autorizaCron(req)) {
     return fail("forbidden", "Cron secret missing or invalid.", 403, { requestId });
   }
 
   const admin = createAdminClient();
   const agora = new Date();
+
+  // A oferta de encaixe tem prazo próprio, mais curto que o do pendente. Com o
+  // módulo desligado esta chamada não toca na tabela.
+  const encaixes = await varrerOfertasVencidas(admin, { agora });
 
   // O prazo é POR ORGANIZAÇÃO, então a varredura não pode usar um corte único
   // de `created_at` no SQL. Busca os pendentes de todas as orgs e aplica o prazo
@@ -79,6 +83,8 @@ async function handle(req: NextRequest): Promise<Response> {
     .from("calendar_appointments")
     .select("id, organization_id, created_at, starts_at")
     .eq("status", "pending")
+    // Pendente de um sistema externo (9392) expira lá, não aqui.
+    .eq("authority", AUTORIDADE_LOCAL)
     .order("created_at", { ascending: true })
     .limit(LIMITE_DA_VARREDURA);
 
@@ -89,7 +95,10 @@ async function handle(req: NextRequest): Promise<Response> {
 
   const linhas = data ?? [];
   if (linhas.length === 0) {
-    return ok({ examinados: 0, expirados: 0, mantidos: 0 }, { requestId });
+    return ok(
+      { examinados: 0, expirados: 0, mantidos: 0, encaixes: encaixes.vencidas, reoferecidos: encaixes.reoferecidas },
+      { requestId },
+    );
   }
 
   // Um SELECT por organização presente, não um por linha.
@@ -123,7 +132,10 @@ async function handle(req: NextRequest): Promise<Response> {
   }
 
   if (expirados.length === 0) {
-    return ok({ examinados: linhas.length, expirados: 0, mantidos }, { requestId });
+    return ok(
+      { examinados: linhas.length, expirados: 0, mantidos, encaixes: encaixes.vencidas, reoferecidos: encaixes.reoferecidas },
+      { requestId },
+    );
   }
 
   // `.eq("status","pending")` de novo: se alguém confirmou entre a leitura e
@@ -132,12 +144,10 @@ async function handle(req: NextRequest): Promise<Response> {
   // desta rota.
   const { data: efetivados, error: erroUpdate } = await admin
     .from("calendar_appointments")
-    .update({
-      status: "cancelled",
-      cancellation_reason: "Pedido expirado: ninguém confirmou dentro do prazo.",
-    })
+    .update(patchDeExpiracao(agora))
     .in("id", expirados)
     .eq("status", "pending")
+    .eq("authority", AUTORIDADE_LOCAL)
     .select("id");
 
   if (erroUpdate) {
@@ -150,6 +160,13 @@ async function handle(req: NextRequest): Promise<Response> {
   }
 
   const quantos = efetivados?.length ?? 0;
+
+  // Pendente que expirou é horário que abriu, e a vaga segurada da lista de
+  // espera também cai aqui se o prazo da organização for menor que o da oferta.
+  for (const { id } of efetivados ?? []) {
+    const organizationId = linhas.find((l) => l.id === id)?.organization_id;
+    if (organizationId) await aposVagaLiberada({ organizationId, appointmentId: id, agora });
+  }
 
   // Rodada que não expirou nada NÃO é mutação e não audita — a lei está no
   // CLAUDE.md §Audit log, e `cron-audita-so-quando-ha-efeito.test.ts` varre o
@@ -164,7 +181,13 @@ async function handle(req: NextRequest): Promise<Response> {
   }
 
   return ok(
-    { examinados: linhas.length, expirados: quantos, mantidos },
+    {
+      examinados: linhas.length,
+      expirados: quantos,
+      mantidos,
+      encaixes: encaixes.vencidas,
+      reoferecidos: encaixes.reoferecidas,
+    },
     { requestId },
   );
 }

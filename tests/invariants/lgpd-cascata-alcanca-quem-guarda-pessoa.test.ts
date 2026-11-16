@@ -55,8 +55,15 @@ const DIVIDA_LGPD_CONHECIDA: Record<string, string> = {
     "Achado do levantamento 13 §2 (QAVivo/maestro). Guarda title e notes do compromisso. " +
     "Conserto DESPACHADO ao Arquiteto — sai desta lista no mesmo commit que acrescentar a tabela à cascata.",
   lead_notes:
-    "Anotação livre do atendente SOBRE o contato (coluna body). Dívida anterior à agenda; " +
-    "nenhum commit a declarou. Sai quando o cascade a alcançar.",
+    "Memória livre do agente SOBRE o contato (headline/body). " +
+    "⚠️ ELA JÁ ESTÁ PROTEGIDA: desde a 0494 (#1964) o gatilho " +
+    "`fn_redigir_conversas_ao_anonimizar` (desenho da 0391) troca headline/body por " +
+    "'(anonimizado)' e anula o embedding na virada de is_anonymized, e " +
+    "`tests/invariants/lgpd-cascata-do-banco-alcanca-notas-itens.test.ts` prova o efeito; " +
+    "a camada de app (lib/lgpd/cascata.ts passo 5, #1958) também a redige. A entrada existe " +
+    "só porque ESTE instrumento lê UMA função e não enxerga trigger — a mesma razão de " +
+    "crm_tasks. Sai no dia em que `tabelasNaCascata()` derivar também os triggers de " +
+    "`contacts`, ou no dia em que a função ganhar o passo.",
   crm_tasks:
     "Migration 0210 (extração do PR #418). A tabela guarda `title` — texto livre que " +
     "na prática nomeia a pessoa (\"Ligar para Fulano confirmar o orçamento\"). " +
@@ -69,6 +76,14 @@ const DIVIDA_LGPD_CONHECIDA: Record<string, string> = {
     "estão aqui, as duas também já cobertas por trigger. Sai no dia em que " +
     "`tabelasNaCascata()` passar a derivar do catálogo também os triggers de " +
     "`contacts`, ou no dia em que a função ganhar o passo.",
+  mensagens_agendadas:
+    "Migration 9336 (#3118, primeira parte). Guarda `title` e `body` do texto agendado para a pessoa. " +
+    "⚠️ ELA JÁ ESTÁ PROTEGIDA: o gatilho `trg_contacts_anonimizado_mensagens_agendadas` troca o texto, " +
+    "apaga o título e cancela o pendente na virada de is_anonymized, e " +
+    "`tests/invariants/lgpd-mensagem-agendada-do-contato-anonimizado.test.ts` prova o efeito pela " +
+    "cascata real. A entrada existe só porque ESTE instrumento lê UMA função e não enxerga gatilho — " +
+    "a mesma razão de crm_tasks. Sai no mesmo dia que crm_tasks: quando `tabelasNaCascata()` derivar " +
+    "também os gatilhos de `contacts`.",
   webhook_lead_captures:
     "captured_name, captured_email e captured_phone — o payload cru de captação. " +
     "A própria migration 0174 escreveu que 'o cascade de anonimização precisa alcançar esta tabela' " +

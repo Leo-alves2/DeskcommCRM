@@ -37,7 +37,7 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import * as path from "node:path";
 
-import { test, expect, type Locator, type Page } from "@playwright/test";
+import { test, expect, type Locator, type Page } from "./helpers/test";
 import { carregarEnvLocal } from "../../scripts/lib/env-de-teste";
 
 const APP_URL = `http://localhost:${process.env.E2E_PORT ?? "3001"}`;
@@ -148,7 +148,7 @@ async function login(page: Page, quem: "manager"): Promise<void> {
   await page.goto(`${APP_URL}/login`);
   await page.getByLabel(/e-?mail/i).fill(creds.users[quem]!.email);
   await page.getByLabel(/senha/i).fill(creds.password);
-  await page.getByRole("button", { name: /entrar/i }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
   await page.waitForURL(/\/app(\/|$)/, { timeout: 20_000 });
 }
 
@@ -220,6 +220,12 @@ test.describe("o agente organiza a operação e a tela conta quem foi", () => {
 
       // ---- a etapa aparece NA TELA, marcada como mudança do assistente ----
       await page.goto(`${APP_URL}/app/settings/tenant/pipelines`);
+      // #4083: com mais de um funil o card nasce RECOLHIDO — quem abre é o
+      // cabeçalho, e é ele que um clique cego fecharia quando o funil é único.
+      const cabecalhoDoFunil = page.getByTestId(`abrir-funil-${funil.id}`);
+      if ((await cabecalhoDoFunil.getAttribute("aria-expanded")) === "false") {
+        await cabecalhoDoFunil.click();
+      }
       const linhaDaEtapa = page.getByTestId(`etapa-${stageId}`);
       await expect(linhaDaEtapa).toBeVisible({ timeout: 15_000 });
       // O nome mora num campo editável (clique para renomear), então `toContainText`

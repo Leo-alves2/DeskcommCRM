@@ -3,8 +3,12 @@ import { redirect } from "next/navigation";
 import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import { ROLE_RANK } from "@/lib/auth/types";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { temPonteiroCanonico } from "@/lib/ai/skills/ponteiro-canonico";
+import { temVersaoNovaNoCatalogo } from "@/lib/ai/skills/versao-nova-catalogo";
+import { compararSkill, type ComparativoEntrada } from "@/lib/ai/skills/comparativo";
 import type { SkillsState } from "@/hooks/ai/useSkills";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { agentesComListaPropria } from "@/lib/ai/skills/skills-do-agente";
 import { SkillsClient } from "./_client";
 
 export const dynamic = "force-dynamic";
@@ -25,23 +29,53 @@ export default async function SkillsPage() {
     admin.from("skill_pointers").select("name, version_id").is("organization_id", null),
   ]);
 
-  const orgRows = orgPointers ?? [];
-  const platformRows = platformPointers ?? [];
+  const orgRows = (orgPointers ?? []).filter(temPonteiroCanonico);
+  const platformRows = (platformPointers ?? []).filter(temPonteiroCanonico);
   const versionIds = [...new Set([...orgRows, ...platformRows].map((p) => p.version_id))];
 
   const { data: versionsRaw } =
     versionIds.length > 0
-      ? await admin.from("skill_versions").select("id, description, forked_from_version_id").in("id", versionIds)
+      ? await admin
+          .from("skill_versions")
+          .select("id, description, body, matcher, forked_from_version_id")
+          .in("id", versionIds)
       : { data: [] };
   const versionById = new Map((versionsRaw ?? []).map((v) => [v.id, v]));
 
+  // Mesma régua do GET /api/v1/ai/skills (temVersaoNovaNoCatalogo), por name,
+  // para o aviso de versão nova vir pronto no primeiro paint (SSR) — não só
+  // depois do refetch da rota.
+  const platformVersionByName = new Map(platformRows.map((p) => [p.name, p.version_id]));
+
   const installed: SkillsState["installed"] = orgRows.map((p) => {
     const v = versionById.get(p.version_id);
+    const forked = v?.forked_from_version_id;
+    const plataforma = platformVersionByName.get(p.name);
+    const versaoNova = temVersaoNovaNoCatalogo(forked, plataforma);
+    // Comparativo (o que mudou) entre a cópia da org e a versão atual do catálogo —
+    // mesma régua do GET /api/v1/ai/skills, para vir pronto no primeiro paint (SSR).
+    const versaoCatalogo = plataforma ? versionById.get(plataforma) : undefined;
+    let comparativo: ReturnType<typeof compararSkill> | null = null;
+    if (versaoNova && v && versaoCatalogo && v.matcher && versaoCatalogo.matcher) {
+      const orgEntrada: ComparativoEntrada = {
+        description: v.description,
+        body: v.body ?? "",
+        matcher: v.matcher,
+      };
+      const catalogoEntrada: ComparativoEntrada = {
+        description: versaoCatalogo.description,
+        body: versaoCatalogo.body ?? "",
+        matcher: versaoCatalogo.matcher,
+      };
+      comparativo = compararSkill(orgEntrada, catalogoEntrada);
+    }
     return {
       name: p.name,
       description: v?.description ?? "",
       version_id: p.version_id,
-      source: (v?.forked_from_version_id ? "catalog" : "manual") as "catalog" | "manual",
+      source: (forked ? "catalog" : "manual") as "catalog" | "manual",
+      versao_nova_catalogo: versaoNova,
+      comparativo,
       updated_at: p.updated_at,
     };
   });
@@ -51,7 +85,11 @@ export default async function SkillsPage() {
     .filter((p) => !installedNames.has(p.name))
     .map((p) => ({ name: p.name, description: versionById.get(p.version_id)?.description ?? "" }));
 
-  const initialState: SkillsState = { installed, catalog };
+  const initialState: SkillsState = {
+    installed,
+    catalog,
+    agentes_com_lista_propria: await agentesComListaPropria(admin, activeOrg.orgId),
+  };
   const idioma = user.idioma;
 
   return (

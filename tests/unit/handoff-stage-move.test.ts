@@ -24,10 +24,17 @@ interface Resposta {
   error: { message: string } | null;
 }
 interface Cenario {
+  /** Os `update` em `crm_leads`, na ordem (#3461: a posição de entrada). */
+  escritas?: unknown[];
+  /** O primeiro card da etapa de destino, lido para pôr o que chega no topo. */
+  topo?: Resposta;
   lead: Resposta;
   etapaDestino: Resposta;
   update: Resposta;
   rpcError?: { message: string } | null;
+  etapaPorSlug?: (slug: string) => Resposta;
+  /** O `crm_pipelines.settings` que a régua de campos obrigatórios lê (#1536). */
+  funil?: Resposta;
 }
 
 function cenario(over: Partial<Cenario> = {}): Cenario {
@@ -60,22 +67,38 @@ function fakeAdmin(c: Cenario, rpcs: ChamadaRpc[] = []) {
       const b = {
         _update: false,
         _select: false,
+        _topo: false,
         _eqKeys: [] as string[],
+        _slugVal: undefined as string | undefined,
         select: () => {
           b._select = true;
           return b;
         },
-        update: () => {
+        update: (payload?: unknown) => {
           b._update = true;
+          if (tabela === "crm_leads") c.escritas?.push(payload);
           return b;
         },
-        eq: (key: string) => {
+        // A leitura do topo da etapa de destino (#3461): `.order().limit()`.
+        order: () => {
+          b._topo = true;
+          return b;
+        },
+        limit: () => b,
+        eq: (key: string, val?: unknown) => {
           b._eqKeys.push(key);
+          if (key === "slug" && typeof val === "string") b._slugVal = val;
           return b;
         },
         maybeSingle: () => {
+          if (tabela === "crm_pipelines")
+            return Promise.resolve(c.funil ?? { data: ETAPA_ORIGEM, error: null });
+          if (tabela === "crm_leads" && b._topo) return Promise.resolve(c.topo ?? { data: null, error: null });
           if (tabela === "crm_leads") return Promise.resolve(c.lead);
-          if (b._eqKeys.includes("slug")) return Promise.resolve(c.etapaDestino);
+          if (b._eqKeys.includes("slug")) {
+            if (c.etapaPorSlug && b._slugVal) return Promise.resolve(c.etapaPorSlug(b._slugVal));
+            return Promise.resolve(c.etapaDestino);
+          }
           return Promise.resolve({ data: ETAPA_ORIGEM, error: null });
         },
         then(onF: (v: unknown) => unknown, onR?: (e: unknown) => unknown) {
@@ -108,6 +131,13 @@ async function moverObservando(c: Cenario) {
 
 describe("moverLeadParaEtapaDeHandoff", () => {
   beforeEach(() => vi.mocked(emitLeadActivity).mockClear());
+
+  it("o card CHEGA no topo da etapa de destino (#3461)", async () => {
+    const escritas: unknown[] = [];
+    const r = await mover(cenario({ escritas, topo: { data: { position_in_stage: -3000 }, error: null } }));
+    expect(r).toMatchObject({ moveu: true });
+    expect(escritas).toEqual([expect.objectContaining({ position_in_stage: -4000 })]);
+  });
 
   it("caminho feliz: move para a etapa de handoff e emite atividade + evento", async () => {
     const { r, eventos } = await moverObservando(cenario());
@@ -204,4 +234,81 @@ it("handoff derivado mantém a continuação do canal A sem observar/iniciar B",
   });
   expect(rpcs.map((call) => call.fn)).not.toContain("fn_service_observe_command");
   expect(rpcs.map((call) => call.fn)).not.toContain("fn_service_begin");
+});
+
+it("encontra etapa legada com sublinhado ('chamar_humano') se não houver etapa com hífen", async () => {
+  const c = cenario({
+    etapaPorSlug: (slug: string) => {
+      if (slug === "chamar_humano") {
+        return { data: { id: "s-handoff-legada", name: "Chamar Humano" }, error: null };
+      }
+      return { data: null, error: null };
+    },
+  });
+  const r = await mover(c);
+  expect(r).toEqual({ moveu: true, motivo: "movido" });
+});
+
+it("erro de banco na busca pelo slug legado é indisponibilidade, não 'sem_etapa_de_handoff'", async () => {
+  const c = cenario({
+    etapaPorSlug: (slug: string) =>
+      slug === "chamar_humano"
+        ? { data: null, error: { message: "fetch failed" } }
+        : { data: null, error: null },
+  });
+  const r = await mover(c);
+  expect(r).toEqual({ moveu: false, motivo: "indisponivel" });
+});
+
+/* ── A RÉGUA DE CAMPOS OBRIGATÓRIOS NO HANDOFF (CR do mantenedor, #1536) ──── */
+
+/**
+ * O handoff também grava `stage_id`, então também pergunta a MESMA pergunta do
+ * arrasto (`validaCamposExigidos`). Sem esta prova o caminho ficaria de fora da
+ * "um teste por caminho" — e uma rota que exige, outra que não, é o defeito da
+ * #917 com outro nome. `obrigatorio_em.etapas` é UUID e `camposDoFunil`
+ * descarta o campo em id fora do formato, por isso a etapa de destino aqui é um
+ * UUID (os `s-handoff` dos dublês não passariam do parse).
+ */
+describe("moverLeadParaEtapaDeHandoff e a régua de campos obrigatórios", () => {
+  beforeEach(() => vi.mocked(emitLeadActivity).mockClear());
+
+  const ETAPA_UUID = "99999999-9999-4999-8999-999999999999";
+  const destinoExigente = () =>
+    cenario({
+      etapaDestino: { data: { ...ETAPA_HANDOFF, id: ETAPA_UUID }, error: null },
+      funil: {
+        data: {
+          settings: {
+            fields: [
+              {
+                key: "concorrente",
+                label: "Concorrente",
+                type: "text",
+                obrigatorio_em: { etapas: [ETAPA_UUID] },
+              },
+            ],
+          },
+        },
+        error: null,
+      },
+    });
+
+  it("não move: devolve `campos_obrigatorios` com o que falta, sem gravar nada", async () => {
+    const r = await mover(destinoExigente());
+
+    expect(r).toEqual({
+      moveu: false,
+      motivo: "campos_obrigatorios",
+      detalhe: expect.stringContaining("Concorrente"),
+    });
+    expect(vi.mocked(emitLeadActivity)).not.toHaveBeenCalled();
+  });
+
+  it("funil SEM a exigência (ou settings ilegível = fail-open) segue movendo como sempre", async () => {
+    const r = await mover(
+      cenario({ etapaDestino: { data: { ...ETAPA_HANDOFF, id: ETAPA_UUID }, error: null } }),
+    );
+    expect(r).toEqual({ moveu: true, motivo: "movido" });
+  });
 });

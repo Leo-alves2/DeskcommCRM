@@ -109,39 +109,43 @@ describe("comando da conversa: o banco espelha o TypeScript", () => {
         for (const [rotulo, silencio] of SILENCIOS) {
           for (const fh of [false, true]) {
             for (const ib of [false, true]) {
+             for (const gr of [false, true]) {
               casos.push({
-                chave: `${status}|${dono ? "dono" : "sem"}|${rotulo}|fh=${fh}|ib=${ib}`,
+                chave: `${status}|${dono ? "dono" : "sem"}|${rotulo}|fh=${fh}|ib=${ib}|grupo=${gr}`,
                 fatos: {
                   status,
                   assigned_to_user_id: dono,
                   bot_silenced_until: silencio,
                   force_human: fh,
                   is_blocked: ib,
+                  // Grupo (migration 0482): sem dono é sempre 'aguardando'.
+                  is_group: gr,
                   // `true` de propósito: o banco não sabe deste fato org-wide
                   // (seria `agenteAtende` numa terceira encarnação), e com ele
                   // ligado o TS produz o mesmo vocabulário de quatro que o SQL.
                   automaticoDaOrg: true,
                 },
               });
+             }
             }
           }
         }
       }
     }
-    expect(casos).toHaveLength(STATUS.length * 2 * SILENCIOS.length * 2 * 2);
+    expect(casos).toHaveLength(STATUS.length * 2 * SILENCIOS.length * 2 * 2 * 2);
 
     const values = casos
       .map((c, i) => {
         const f = c.fatos;
         const s = f.bot_silenced_until === null ? "null" : `'${f.bot_silenced_until}'`;
         const d = f.assigned_to_user_id === null ? "null" : `'${f.assigned_to_user_id}'`;
-        return `(${i}, '${f.status}', ${d}::uuid, ${s}::timestamptz, ${f.force_human}, ${f.is_blocked})`;
+        return `(${i}, '${f.status}', ${d}::uuid, ${s}::timestamptz, ${f.force_human}, ${f.is_blocked}, ${f.is_group})`;
       })
       .join(",\n");
 
     const saida = sql(
-      `select i || '=' || public.fn_comando_da_conversa(st, dono, sil, fh, ib, '${AGORA}'::timestamptz)
-         from (values\n${values}\n) as t(i, st, dono, sil, fh, ib) order by i`,
+      `select i || '=' || public.fn_comando_da_conversa(st, dono, sil, fh, ib, '${AGORA}'::timestamptz, gr)
+         from (values\n${values}\n) as t(i, st, dono, sil, fh, ib, gr) order by i`,
     );
     const doBanco = new Map(
       saida
@@ -176,11 +180,19 @@ describe("comando da conversa: o banco espelha o TypeScript", () => {
       { n: 6, status: "closed", dono: null, sil: null, fh: false, ib: false },
       { n: 7, status: "pending", dono: null, sil: null, fh: false, ib: false },
       { n: 8, status: "resolved", dono: null, sil: null, fh: false, ib: false },
+      // Grupo (migration 0482): o wrapper tem de passar `c.is_group` — sem dono,
+      // 'aguardando'; com dono, 'humano'; fechado, 'encerrada'.
+      { n: 9, status: "open", dono: null, sil: null, fh: false, ib: false, grupo: true },
+      { n: 10, status: "open", dono: DONO, sil: null, fh: false, ib: false, grupo: true },
+      { n: 11, status: "closed", dono: null, sil: null, fh: false, ib: false, grupo: true },
     ];
 
     sql(`
       delete from conversations where organization_id = '${ORG}';
       delete from contacts where organization_id = '${ORG}';
+      update public.ai_agents set published_version_id = null where organization_id = '${ORG}';
+      delete from public.ai_agent_versions where organization_id = '${ORG}';
+      delete from public.ai_agents where organization_id = '${ORG}';
       delete from channel_sessions where organization_id = '${ORG}';
       delete from organizations where id = '${ORG}';
       insert into auth.users (id, email)
@@ -189,15 +201,34 @@ describe("comando da conversa: o banco espelha o TypeScript", () => {
         values ('${ORG}', 'espelho-comando', 'Espelho LTDA', 'Espelho');
       insert into channel_sessions (id, organization_id, webhook_secret_encrypted, waha_session_name)
         values ('${ORG}', '${ORG}', '\\x00', 'espelho-sess');
+      -- A organização deste bloco TEM agente publicado, e isso passou a ser
+      -- medição, não suposição: desde a issue #4012 o wrapper devolve ninguém
+      -- (e não automático) para conversa sem dono numa org SEM agente, e o
+      -- automaticoDaOrg: true que este bloco passa ao TS só é honesto se o
+      -- banco disser o mesmo. Sem estas linhas o bloco mediria a divergência
+      -- nova em vez do que veio medir (o bit do contato, o grupo, o dono).
+      -- A versão é publicada NA SESSÃO das conversas: a segunda metade da #4012
+      -- pergunta pelo NÚMERO (fn_automatico_da_conversa), e sem agente nesta
+      -- sessão o wrapper responderia aguardando por um fato que este bloco
+      -- também não veio medir.
+      -- A ordem é agente -> versão -> ponteiro: as duas FKs se cruzam.
+      insert into ai_agents (id, organization_id, name, system_prompt)
+        values ('aaaaaaaa-0000-4000-8000-00000000ba01', '${ORG}', 'Espelho', 'prompt');
+      insert into ai_agent_versions (id, organization_id, agent_id, version_number, system_prompt, provider, model, channel_session_id, status, published_at)
+        values ('aaaaaaaa-0000-4000-8000-00000000ba02', '${ORG}', 'aaaaaaaa-0000-4000-8000-00000000ba01',
+                1, 'prompt', 'anthropic', 'claude-sonnet-4-6', '${ORG}', 'published', now());
+      update ai_agents set published_version_id = 'aaaaaaaa-0000-4000-8000-00000000ba02'
+       where id = 'aaaaaaaa-0000-4000-8000-00000000ba01';
       ${linhas
         .map(
           (l) => `
       insert into contacts (id, organization_id, force_human, is_blocked)
         values ('aaaaaaaa-0000-4000-8000-00000000c${String(l.n).padStart(3, "0")}', '${ORG}', ${l.fh}, ${l.ib});
-      insert into conversations (id, organization_id, contact_id, channel_session_id, status, assigned_to_user_id, bot_silenced_until)
+      insert into conversations (id, organization_id, contact_id, channel_session_id, status, assigned_to_user_id, bot_silenced_until, is_group, group_chat_id)
         values ('aaaaaaaa-0000-4000-8000-00000000e${String(l.n).padStart(3, "0")}', '${ORG}',
                 'aaaaaaaa-0000-4000-8000-00000000c${String(l.n).padStart(3, "0")}', '${ORG}', '${l.status}',
-                ${l.dono ? `'${l.dono}'` : "null"}, ${l.sil ? `'${l.sil}'` : "null"});`,
+                ${l.dono ? `'${l.dono}'` : "null"}, ${l.sil ? `'${l.sil}'` : "null"},
+                ${l.grupo === true}, ${l.grupo === true ? `'${l.n}@g.us'` : "null"});`,
         )
         .join("\n")}
     `);
@@ -225,7 +256,11 @@ describe("comando da conversa: o banco espelha o TypeScript", () => {
           bot_silenced_until: l.sil,
           force_human: l.fh,
           is_blocked: l.ib,
+          is_group: l.grupo === true,
           automaticoDaOrg: true,
+          // O número do fixture tem agente publicado (ver o insert acima): o
+          // fato por número não rebaixa nenhuma das linhas abaixo.
+          automaticoDaConversa: true,
         },
         // O wrapper usa `now()` do banco; estas linhas não ficam na fronteira do
         // relógio de propósito (só `infinity`/`null`), então a comparação é estável.

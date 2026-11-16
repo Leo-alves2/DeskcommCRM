@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
  * aceita o que não devia escreve lixo no banco de quem instalou, e ninguém
  * descobre até a conversa errada aparecer no inbox.
  */
+import { extrairAtribuicaoMeta } from "@/lib/channels/atribuicao-de-anuncio-oficial";
 import {
   parseZernioInbound,
   resolveZernioIdentity,
@@ -170,6 +171,96 @@ describe("eventos de DESFECHO", () => {
 
   it("message.sent é mensagem NOVA, não só desfecho — é o que faz o envio externo aparecer", () => {
     expect(status("message.sent")?.kind).toBe("message");
+  });
+
+  it("carrega a HORA do desfecho (statusAt), não a de chegada do webhook", () => {
+    expect(
+      status("message.read", { statusAt: "2026-09-24T14:24:23.000Z", timestamp: "2026-09-24T14:24:30.706Z" })
+        ?.statusAt,
+    ).toBe("2026-09-24T14:24:23.000Z");
+    // sem statusAt, o carimbo do evento é a melhor aproximação que existe
+    expect(status("message.delivered", { timestamp: "2026-09-24T16:10:38.088Z" })?.statusAt).toBe(
+      "2026-09-24T16:10:38.088Z",
+    );
+    expect(parseZernioInbound(payload())?.statusAt).toBeUndefined();
+  });
+});
+
+describe("clique em anúncio (Clique para o WhatsApp)", () => {
+  // A FORMA do evento real (24/09/2026): o `referral` mora em `metadata`, no nível
+  // do evento — não na mensagem. Valores sintéticos; as chaves são as que chegaram.
+  const referral = {
+    body: "Frete grátis para todo o país",
+    headline: "FRETE GRÁTIS",
+    ctwa_clid: "ARAkZ_sintetico",
+    source_id: "120200000000000001",
+    source_type: "ad",
+    source_url: "https://fb.me/sintetico",
+    media_type: "video",
+    video_url: "https://video.example/v.mp4",
+    thumbnail_url: "https://video.example/t.jpg",
+    welcome_message: { text: "Olá" },
+  };
+
+  it("lê o referral de metadata — é onde o Zernio o entrega", () => {
+    const r = parseZernioInbound(payload({ metadata: { referral } }));
+    expect(r?.referral).toEqual(referral);
+    expect(extrairAtribuicaoMeta(r?.referral)).toMatchObject({
+      sourceId: "ARAkZ_sintetico",
+      adId: "120200000000000001",
+      titulo: "FRETE GRÁTIS",
+    });
+  });
+
+  it("segue lendo as posições da Cloud API (mensagem e raiz) quando metadata não traz", () => {
+    expect(parseZernioInbound(payload({}, { referral }))?.referral).toEqual(referral);
+    expect(parseZernioInbound(payload({ referral }))?.referral).toEqual(referral);
+  });
+
+  it("mensagem que não veio de anúncio segue sem referral", () => {
+    expect(parseZernioInbound(payload({ metadata: {} }))?.referral).toBeNull();
+  });
+});
+
+describe("pino de localização — as coordenadas vêm no webhook", () => {
+  // A FORMA medida em 27/10/2026 no log de entregas do provedor (30 dias, 50
+  // pinos): `metadata.location` no nível do EVENTO, ao lado do `referral`, com
+  // `latitude`/`longitude` numéricos — 43 só com eles, 7 também com `name` e
+  // `address`. Valores públicos aqui, nunca o pino de um cliente.
+  const pino = (location: unknown, texto = "📍 Location") =>
+    payload({ metadata: { location } }, { text: texto });
+
+  it("⭐ lê latitude e longitude de metadata.location", () => {
+    const r = parseZernioInbound(pino({ latitude: -23.5855, longitude: -46.6094 }));
+    expect(r?.location).toEqual({ latitude: -23.5855, longitude: -46.6094 });
+  });
+
+  it("lugar com nome: nome e endereço viram `nome` e `endereco`", () => {
+    const r = parseZernioInbound(
+      pino({ latitude: -23.5855, longitude: -46.6094, name: "Museu do Ipiranga", address: "Ipiranga, São Paulo, SP" }, "📍 Museu do Ipiranga"),
+    );
+    expect(r?.location).toEqual({
+      latitude: -23.5855,
+      longitude: -46.6094,
+      nome: "Museu do Ipiranga",
+      endereco: "Ipiranga, São Paulo, SP",
+    });
+  });
+
+  it("o eco de saída com o pino em message.metadata também é lido", () => {
+    const r = parseZernioInbound(
+      payload({ event: "message.sent" }, { direction: "outgoing", metadata: { location: { latitude: 1.5, longitude: 2.5 } } }),
+    );
+    expect(r?.location).toEqual({ latitude: 1.5, longitude: 2.5 });
+  });
+
+  it("sem pino, sem coordenadas inválidas e sem evento de desfecho: a chave nem aparece", () => {
+    expect(parseZernioInbound(payload())).not.toHaveProperty("location");
+    expect(parseZernioInbound(pino({ latitude: 0, longitude: 0 }))).not.toHaveProperty("location");
+    expect(parseZernioInbound(pino({ latitude: "x", longitude: null }))).not.toHaveProperty("location");
+    expect(
+      parseZernioInbound(payload({ event: "message.delivered", metadata: { location: { latitude: 1, longitude: 2 } } })),
+    ).not.toHaveProperty("location");
   });
 });
 

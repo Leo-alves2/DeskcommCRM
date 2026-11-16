@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ConversationHeader } from "@/components/inbox/ConversationHeader";
@@ -55,6 +55,9 @@ vi.mock("@/hooks/inbox/useReleaseConversation", () => ({
 vi.mock("@/hooks/inbox/useResumeAiAttendance", () => ({
   useResumeAiAttendance: () => ({ mutate: vi.fn(), isPending: false }),
 }));
+// O header monta o discador (`DialButton`), que exige o `VoiceCallProvider` do
+// shell autenticado. Aqui só a largura importa: o discador fica fora da conta.
+vi.mock("@/components/voice/DialButton", () => ({ DialButton: () => null }));
 vi.mock("@/hooks/auth/AuthProvider", () => ({
   usePermission: () => true,
   useAuth: () => ({ user: { id: "u-1" }, activeOrg: { orgId: "org-1", role: "manager" } }),
@@ -72,13 +75,38 @@ const conversation = {
   contacts: { id: "ct-1", display_name: "Fulana", name: null, phone_number: "5511999" },
 } as unknown as React.ComponentProps<typeof ConversationHeader>["conversation"];
 
-function renderHeader() {
+function renderHeader(conv = conversation) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <ConversationHeader conversation={conversation} />
+      <ConversationHeader conversation={conv} />
     </QueryClientProvider>,
   );
+}
+
+// A barra é quem segura os botões, não um índice fixo: desde o #1625 o
+// `children[1]` do header é a coluna que empilha a barra e o selo do automático.
+//
+// Desde o #3003 a âncora é o gatilho do menu ⋯, e não o rótulo "Transferir":
+// ela precisa existir em TODO estado do cabeçalho (é o que garante que nenhuma
+// ação secundária fique sem casa), enquanto os rótulos entram e saem com o
+// estado da conversa.
+function barraDeAcoes() {
+  const barra = screen.getByTestId("menu-de-acoes").parentElement;
+  expect(barra, "a barra de ações não renderizou").toBeTruthy();
+  return barra as HTMLElement;
+}
+
+/** Abre o ⋯ (Radix abre no `pointerdown`) e devolve o conteúdo portalizado. */
+function abrirOMenu(): HTMLElement {
+  fireEvent.pointerDown(screen.getByTestId("menu-de-acoes"), {
+    button: 0,
+    ctrlKey: false,
+    pointerId: 1,
+  });
+  const conteudo = screen.getByTestId("menu-de-acoes-conteudo");
+  expect(conteudo, "o menu ⋯ não abriu").toBeTruthy();
+  return conteudo;
 }
 
 describe("header do inbox — não trava a largura da tela", () => {
@@ -89,18 +117,21 @@ describe("header do inbox — não trava a largura da tela", () => {
     // passariam por não haver o que verificar.
     expect(header, "o header não renderizou").toBeTruthy();
 
-    const acoes = header.children[1] as HTMLElement;
-    expect(acoes, "a barra de ações não renderizou").toBeTruthy();
-    expect(
-      acoes.className.split(/\s+/),
-      "`shrink-0` de volta na barra de ações: o header volta a travar em 707px e o painel de CRM sai da tela em 1280px",
-    ).not.toContain("shrink-0");
+    const coluna = header.children[1] as HTMLElement;
+    expect(coluna, "a coluna de ações não renderizou").toBeTruthy();
+    for (const el of [coluna, barraDeAcoes()]) {
+      expect(
+        el.className.split(/\s+/),
+        "`shrink-0` de volta na barra de ações: o header volta a travar em 707px e o painel de CRM sai da tela em 1280px",
+      ).not.toContain("shrink-0");
+      expect(el.className).toContain("min-w-0");
+    }
   });
 
   it("o header pode reorganizar em vez de esconder ação", () => {
     const { container } = renderHeader();
     const header = container.firstElementChild as HTMLElement;
-    const acoes = header.children[1] as HTMLElement;
+    const acoes = barraDeAcoes();
     // As duas pontas: o container quebra E a barra quebra internamente. Só uma
     // das duas não basta — sem a de dentro, a barra desce inteira e continua
     // pedindo a largura toda.
@@ -118,18 +149,106 @@ describe("header do inbox — não trava a largura da tela", () => {
     }
   });
 
-  it('"Ver contato" existe no DOM e só se cala onde há outra porta', () => {
+  it("com o selo do automático, nenhuma ação some e o selo não divide linha com nome nem ações (#1625)", () => {
+    // O defeito do #1625: o selo morava na linha do nome, alargava a identidade
+    // e jogava a barra inteira para baixo. O conserto recusado escondia ações
+    // num menu "Mais ações"; o aceito tira o selo das duas linhas.
+    renderHeader({
+      ...conversation,
+      assigned_to_user_id: "u-1",
+      assigned_to_user_name: "Eu",
+      assignee_kind: "user",
+      bot_silenced_until: new Date(Date.now() + 10 * 60_000).toISOString(),
+    } as typeof conversation);
+
+    const selo = screen.getByTestId("badge-atendimento-humano");
+    expect(selo.textContent).toBe("Automático volta em instantes");
+
+    const barra = barraDeAcoes();
+    expect(barra.contains(selo), "o selo voltou para a linha das ações").toBe(false);
+    const linhaDoNome = screen.getByRole("heading", { name: "Fulana" }).parentElement as HTMLElement;
+    expect(linhaDoNome.contains(selo), "o selo voltou para a linha do nome").toBe(false);
+
+    // ─── A RÉGUA MUDOU DE LUGAR, NÃO DE TAMANHO (#3003) ────────────────────
+    //
+    // Este caso dizia "as seis ações estão DENTRO da barra" e proibia um menu.
+    // Desde o #3003 a regra é a do doc de decisão 251 (03/11, opção A):
+    // "nenhuma ação some da conversa: as do dia a dia ficam à vista e o resto
+    // fica no ⋯". É o que o caso sempre quis proteger — NENHUMA AÇÃO SOME. Cada
+    // um dos seis rótulos continua alcançável no cabeçalho, e as que saíram da
+    // barra têm de estar no menu (não basta não estarem em lugar nenhum).
+    const menu = abrirOMenu();
+    for (const rotulo of ["Liberar", "Devolver ao automático", "Transferir", "Lembrar", "Fechar", "Arquivar"]) {
+      expect(
+        screen.queryAllByText(rotulo).length,
+        `a ação "${rotulo}" sumiu do cabeçalho — nem na barra, nem no menu`,
+      ).toBeGreaterThan(0);
+    }
+    // As do dia a dia seguem à vista...
+    for (const rotulo of ["Liberar", "Devolver ao automático", "Transferir", "Fechar"]) {
+      expect(
+        within(barra).queryAllByText(rotulo).length,
+        `a ação "${rotulo}" saiu da barra sem ser do dia a dia`,
+      ).toBeGreaterThan(0);
+    }
+    // ...e as secundárias estão no menu, com nome.
+    for (const rotulo of ["Lembrar", "Arquivar"]) {
+      expect(
+        within(menu).queryAllByText(rotulo).length,
+        `"${rotulo}" saiu da barra e não está no menu: ação de quem atende escondida`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("no celular a barra é UMA fileira que rola, não três ou quatro que comem a conversa", () => {
+    // Relato de quem atende pelo telefone: com ~390px a barra quebrava em várias
+    // fileiras e sobrava pouca altura para as mensagens. Abaixo do `md` ela não
+    // quebra — rola na horizontal — e nenhum botão encolhe até virar ilegível.
     renderHeader();
-    // Ele NÃO sai do markup: some por CSS a partir de `xl`, exatamente a largura
-    // em que o painel lateral entra na tela com um "Ver contato" próprio. A
-    // distinção importa — remover do DOM tiraria a ação de quem usa 1024px, que
-    // é onde o painel não existe e esta é a única porta para o contato.
-    const link = screen.getByText("Ver contato").closest("a, button") as HTMLElement;
+    const classes = barraDeAcoes().className.split(/\s+/);
+    for (const c of ["max-md:flex-nowrap", "max-md:overflow-x-auto", "max-md:[&>*]:shrink-0"]) {
+      expect(classes, `sem \`${c}\` a barra volta a empilhar fileiras no celular`).toContain(c);
+    }
+  });
+
+  it("no celular Assumir vem primeiro, a fileira mostra que rola e some com o teclado (F2)", () => {
+    // Só CSS: a ordem do DOM (a do computador e a do teclado) não muda.
+    renderHeader();
+    const assumir = screen.getByRole("button", { name: "Assumir" });
+    expect(assumir.className.split(/\s+/)).toContain("max-md:order-first");
+
+    const barra = barraDeAcoes();
+    expect(barra.className, "sem a máscara nada indica que há botões à direita").toMatch(
+      /max-md:\[mask-image:linear-gradient\(/,
+    );
+    // Com o teclado aberto a coluna das ações sai, e o fio fica com a altura.
+    // `max-md:` é obrigatório: no computador encolher a janela não é teclado.
+    const coluna = barra.parentElement as HTMLElement;
+    expect(coluna.className.split(/\s+/)).toContain("max-md:group-data-[teclado-aberto]/conversa:hidden");
+    expect(coluna.className).not.toMatch(/(?:^|\s)group-data-\[teclado-aberto\]/);
+  });
+
+  it("no celular o telefone sai do cabeçalho (continua na Ficha)", () => {
+    renderHeader();
+    const telefone = screen.getByText(/5511999|\+55/).closest("p") as HTMLElement;
+    expect(telefone.className.split(/\s+/)).toContain("max-md:hidden");
+  });
+
+  it('"Ver contato" existe no DOM — agora no menu ⋯, em qualquer largura', () => {
+    renderHeader();
+    // Ele NÃO sai do markup, e a razão original continua valendo: abaixo de
+    // 1280px o painel lateral não existe, e esta é a única porta para o contato.
+    //
+    // O que mudou (#3003) é ONDE ele mora. Era um botão `xl:hidden` na barra,
+    // escondido por CSS a partir de 1280px para não duplicar o "Ver contato" do
+    // painel. No menu a duplicata não custa fileira nenhuma, então o item
+    // aparece em qualquer largura — e deixou de precisar de `xl:hidden`. O que
+    // este caso vigia agora é o que de fato importa: a porta existe, abre a
+    // ficha certa, e tem guia.
+    const menu = abrirOMenu();
+    const link = within(menu).getByText("Ver contato").closest("a") as HTMLElement;
     expect(link, "o link para o contato sumiu do markup").toBeTruthy();
-    const classes = `${link.className} ${link.parentElement?.className ?? ""}`;
-    expect(
-      classes,
-      "sem `xl:hidden`, a duplicata volta e o header ganha uma segunda linha em 1280px",
-    ).toContain("xl:hidden");
+    expect(link.getAttribute("href")).toBe("/app/contacts/ct-1");
+    expect(link.getAttribute("title")?.trim(), "a porta para o contato está sem guia").toBeTruthy();
   });
 });

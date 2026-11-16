@@ -14,6 +14,7 @@ import type { Lead } from "@/lib/types/leads";
 
 const estado = vi.hoisted(() => ({ podeMover: true }));
 const post = vi.hoisted(() => vi.fn());
+const get = vi.hoisted(() => vi.fn());
 /**
  * O dublê RECEBE a chave. Um `usePermission: () => estado.podeMover` sem
  * parâmetro prova que EXISTE um gate, não que o gate é `pipeline.move_card`:
@@ -23,7 +24,7 @@ const post = vi.hoisted(() => vi.fn());
  */
 const permissao = vi.hoisted(() => vi.fn((_chave: string) => true));
 
-vi.mock("@/lib/api/client", () => ({ apiClient: { post, get: vi.fn(), patch: vi.fn() } }));
+vi.mock("@/lib/api/client", () => ({ apiClient: { post, get, patch: vi.fn() } }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn(), warning: vi.fn() } }));
 vi.mock("@/hooks/auth/AuthProvider", () => ({
   usePermission: (chave: string) => permissao(chave),
@@ -35,6 +36,9 @@ vi.mock("@/hooks/kanban/useUpdateLead", () => ({
 vi.mock("@/hooks/inbox/useAssignableMembers", () => ({ useAssignableMembers: () => ({ data: [] }) }));
 vi.mock("@/hooks/kanban/useAssignableAgents", () => ({ useAssignableAgents: () => ({ data: [] }) }));
 vi.mock("@/components/kanban/LoseLeadDialog", () => ({ LoseLeadDialog: () => null }));
+vi.mock("@/components/kanban/MoveToOtherPipelineDialog", () => ({
+  MoveToOtherPipelineDialog: () => null,
+}));
 vi.mock("@/components/kanban/EditLeadDialog", () => ({ EditLeadDialog: () => null }));
 
 const LEAD = {
@@ -78,6 +82,8 @@ beforeEach(() => {
   abrirDossie.mockReset();
   post.mockReset();
   post.mockResolvedValue({ data: { updated_count: 1 } });
+  get.mockReset();
+  get.mockResolvedValue({ data: [] });
 });
 
 describe("menu do card — Excluir", () => {
@@ -85,7 +91,7 @@ describe("menu do card — Excluir", () => {
     const user = userEvent.setup();
     renderMenu();
 
-    await user.click(screen.getByRole("button", { name: "Ações do lead" }));
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
     await user.click(await screen.findByRole("menuitem", { name: "Excluir" }));
 
     expect(await screen.findByText('Excluir "Proposta da ACME"?')).toBeTruthy();
@@ -103,11 +109,35 @@ describe("menu do card — Excluir", () => {
     });
   });
 
+  it("D10: negocio com proposta enviada — a confirmacao avisa antes de excluir", async () => {
+    get.mockResolvedValue({ data: [{ status: "enviada", numero: 2, ano: 2026 }] });
+    const user = userEvent.setup();
+    renderMenu();
+
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Excluir" }));
+    await screen.findByText('Excluir "Proposta da ACME"?');
+
+    expect(await screen.findByText(/0002\/2026/)).toBeTruthy();
+  });
+
+  it("D10: negocio sem proposta enviada — sem aviso extra na confirmacao", async () => {
+    get.mockResolvedValue({ data: [] });
+    const user = userEvent.setup();
+    renderMenu();
+
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Excluir" }));
+    await screen.findByText('Excluir "Proposta da ACME"?');
+
+    expect(screen.queryByText(/continua em Propostas/)).toBeNull();
+  });
+
   it("cancelar fecha a confirmação e segue sem excluir", async () => {
     const user = userEvent.setup();
     renderMenu();
 
-    await user.click(screen.getByRole("button", { name: "Ações do lead" }));
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
     await user.click(await screen.findByRole("menuitem", { name: "Excluir" }));
     await screen.findByText('Excluir "Proposta da ACME"?');
 
@@ -121,7 +151,7 @@ describe("menu do card — Excluir", () => {
     const user = userEvent.setup();
     renderMenu();
 
-    await user.click(screen.getByRole("button", { name: "Ações do lead" }));
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
     await user.click(await screen.findByRole("menuitem", { name: "Excluir" }));
     await screen.findByText('Excluir "Proposta da ACME"?');
 
@@ -145,7 +175,7 @@ describe("menu do card — Excluir", () => {
     const user = userEvent.setup();
     renderMenu();
 
-    await user.click(screen.getByRole("button", { name: "Ações do lead" }));
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
     await user.click(await screen.findByRole("menuitem", { name: "Excluir" }));
     await screen.findByText('Excluir "Proposta da ACME"?');
     abrirDossie.mockReset();
@@ -173,14 +203,34 @@ describe("menu do card — Excluir", () => {
     const user = userEvent.setup();
     renderMenu();
 
-    await user.click(screen.getByRole("button", { name: "Ações do lead" }));
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
     await screen.findByRole("menuitem", { name: "Editar" });
     expect(screen.queryByRole("menuitem", { name: "Excluir" })).toBeNull();
   });
 
+  it("sem permissão de mexer no funil, 'Levar para outro funil' também some", async () => {
+    estado.podeMover = false;
+    const user = userEvent.setup();
+    renderMenu();
+
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
+    await screen.findByRole("menuitem", { name: "Editar" });
+    expect(screen.queryByRole("menuitem", { name: "Levar para outro funil" })).toBeNull();
+  });
+
+  it("com permissão, 'Levar para outro funil' aparece no menu — mesmo gate do Excluir", async () => {
+    const user = userEvent.setup();
+    renderMenu();
+
+    await user.click(screen.getByRole("button", { name: "Ações do negócio" }));
+    expect(
+      await screen.findByRole("menuitem", { name: "Levar para outro funil" }),
+    ).toBeTruthy();
+  });
+
   it("o botão do menu não depende de hover: no toque ele fica visível", () => {
     renderMenu();
-    const botao = screen.getByRole("button", { name: "Ações do lead" });
+    const botao = screen.getByRole("button", { name: "Ações do negócio" });
     // Mesmo padrão de `components/inbox/MessageBubble.tsx`: visível por padrão,
     // escondido até o hover só onde existe hover.
     expect(botao.className).toContain("[@media(hover:hover)]:opacity-0");

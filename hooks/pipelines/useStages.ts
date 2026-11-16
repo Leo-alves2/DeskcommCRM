@@ -3,6 +3,8 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { apiClient } from "@/lib/api/client";
 
+import { chaveDoQuadro } from "@/hooks/kanban/useBoard";
+
 import { chaveDoFunil } from "./useAgentMapping";
 
 /**
@@ -37,12 +39,35 @@ export interface PatchDeEtapa {
   is_won?: boolean;
   is_lost?: boolean;
   depois_de?: string | null;
+  /**
+   * Probabilidade de ganho da etapa, 0–100. `null` limpa a calibração — e a
+   * previsão volta a reportar a etapa no balde "sem probabilidade".
+   */
+  win_probability?: number | null;
+  /** Negócio que entra nesta etapa abre um aviso na Central (migration 0440). */
+  avisar_na_central?: boolean;
+  /**
+   * Janela de "esfriando" da etapa, em HORAS (issue #1532). `null` limpa a
+   * configuração e a etapa volta ao padrão de 24 h/72 h. Fora de 1 a 8760
+   * inteiro a rota responde 422 — a coluna é `numeric` sem CHECK.
+   */
+  expected_duration_hours?: number | null;
 }
 
 function useReler(pipelineId: string) {
   const qc = useQueryClient();
   return () => {
     void qc.invalidateQueries({ queryKey: chaveDoFunil(pipelineId) });
+    /**
+     * ⚠️ E O QUADRO TAMBÉM (#3874). Renomear, reordenar ou desativar etapa aqui
+     * é uma escrita em `crm_stages` — a MESMA tabela que desenha o Kanban. Até
+     * esta linha, o quadro só relia quando ele mesmo escrevia (`useRenameStage`,
+     * do cabeçalho da coluna, invalida `chaveDoQuadro`); vindo de
+     * Configurações, o cache ficava com a ordem e o nome antigos até um F5.
+     * O sintoma era o pior tipo: a tela de etapas mostrava a coluna nova, o
+     * quadro mostrava a velha, e ninguém sabia em qual acreditar.
+     */
+    void qc.invalidateQueries({ queryKey: chaveDoQuadro(pipelineId) });
   };
 }
 

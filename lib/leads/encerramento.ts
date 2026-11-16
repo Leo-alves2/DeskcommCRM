@@ -24,9 +24,20 @@ import type { Actor, HandlerCtx } from "@/lib/api/handlers/types";
 import { ApiError } from "@/lib/api/types";
 import { audit } from "@/lib/audit";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { posicaoDeEntradaNaEtapa } from "@/lib/kanban/entrada-na-etapa";
 import { emitLeadActivity } from "@/lib/leads/activity-emitter";
 import { registraFalhaDeAtividade } from "@/lib/leads/activity-write-failure";
-import { recusaDeMotivoDaPerdaPeloBanco } from "@/lib/leads/motivo-da-perda";
+import {
+  camposComAnexo,
+  recusaDeCamposObrigatorios,
+  recusaDeMotivoDoGanho,
+  settingsDoFunil,
+  validaCamposExigidos,
+} from "@/lib/leads/campos-exigidos";
+import {
+  razaoDaPerdaNaTimeline,
+  recusaDeMotivoDaPerdaPeloBanco,
+} from "@/lib/leads/motivo-da-perda";
 
 /** Como a demanda terminou. Não há terceira: encerrar é ganhar ou perder. */
 export type DesfechoDaDemanda = "won" | "lost";
@@ -34,7 +45,12 @@ export type DesfechoDaDemanda = "won" | "lost";
 export interface EncerraDemandaInput {
   leadId: string;
   desfecho: DesfechoDaDemanda;
-  /** OBRIGATÓRIO em `lost` (P-03): perder sem motivo não ensina nada a ninguém. */
+  /**
+   * OBRIGATÓRIO em `lost` (P-03): perder sem motivo não ensina nada a ninguém.
+   * Em `won` é o MOTIVO DE GANHO (issue #1536): vai para `crm_leads.won_reason`
+   * na mesma escrita, é texto livre quando o funil não tem lista e passa a ser
+   * exigido quando `settings.won_reason_required` está ligado.
+   */
   motivo?: string | null;
   /**
    * A razão da linha na timeline, quando o desfecho padrão ("Ganho" /
@@ -47,6 +63,13 @@ export interface EncerraDemandaInput {
   razaoNaTimeline?: string;
   /** Acrescentado ao `payload` da linha (ex.: para onde o negócio foi). */
   payloadNaTimeline?: Record<string, unknown>;
+  /**
+   * Para quem fecha SEM intenção humana (o aviso de pago do provedor): só fecha
+   * negócio ainda aberto e na etapa lida, e a condição vai no PRÓPRIO update.
+   * Se alguém encerrou ou mexeu no card nesse meio-tempo, 409 `state_conflict`
+   * e nada é escrito — a decisão humana vence. Os caminhos humanos não usam.
+   */
+  travaOtimista?: boolean;
 }
 
 export interface DemandaEncerrada {
@@ -68,10 +91,20 @@ function actorAuditPayload(actor: Actor): {
   };
 }
 
+function conflitoDeEstado(ctx: HandlerCtx): ApiError {
+  return new ApiError(
+    409,
+    "state_conflict",
+    undefined,
+    ctx.requestId,
+    traduzir("O negócio mudou enquanto era encerrado.", ctx.idioma ?? "pt-BR"),
+  );
+}
+
 /**
  * Fecha o negócio movendo-o para o estágio terminal do funil.
  *
- * ⚠️ SEM TRAVA OTIMISTA, de propósito (o comportamento que já existia): encerrar
+ * ⚠️ SEM TRAVA OTIMISTA por padrão (o comportamento que já existia): encerrar
  * é intenção explícita, e recusar porque o card se mexeu entre o clique e o
  * commit obrigaria a pessoa a repetir uma decisão que ela já tomou. O `status` e
  * o `closed_at` são do trigger `fn_crm_lead_close_on_stage` — não se escreve
@@ -120,6 +153,9 @@ export async function encerraDemanda(
   if ((lead as { status: string }).status === input.desfecho) {
     return { lead: lead as Record<string, unknown>, jaEstava: true };
   }
+  if (input.travaOtimista && (lead as { status: string }).status !== "open") {
+    throw conflitoDeEstado(ctx);
+  }
 
   const colunaTerminal = input.desfecho === "won" ? "is_won" : "is_lost";
   const { data: stage, error: stErr } = await supabase
@@ -152,35 +188,105 @@ export async function encerraDemanda(
   }
 
   const terminalStageId = (stage as { id: string }).id;
-  const { data: maxPosition, error: maxPositionErr } = await supabase
+  // O card que CHEGA à etapa de ganho/perda entra no TOPO (#3461), a mesma
+  // regra da criação e do move sem posição: lê-se o PRIMEIRO da etapa.
+  const { data: primeiraPosicao, error: primeiraPosicaoErr } = await supabase
     .from("crm_leads")
     .select("position_in_stage")
     .eq("organization_id", ctx.organization_id)
     .eq("stage_id", terminalStageId)
-    .order("position_in_stage", { ascending: false })
+    .order("position_in_stage", { ascending: true })
     .limit(1)
     .maybeSingle();
 
-  if (maxPositionErr) {
-    throw new ApiError(500, "internal_error", undefined, ctx.requestId, maxPositionErr.message);
+  if (primeiraPosicaoErr) {
+    throw new ApiError(500, "internal_error", undefined, ctx.requestId, primeiraPosicaoErr.message);
   }
 
-  const nextPosition =
-    maxPosition?.position_in_stage === null || maxPosition?.position_in_stage === undefined
-      ? 1000
-      : Number(maxPosition.position_in_stage) + 1000;
+  // ── OS CAMPOS OBRIGATÓRIOS E O MOTIVO DE GANHO (issue #1536) ────────────────
+  //
+  // Esta função é o fecho compartilhado: botão "Marcar como ganho/perdido",
+  // `/win`, `/lose`, a origem do clone, `crm_close_demand` (MCP) e a ação
+  // `create_or_move_lead`. Validar AQUI é o que cobre cinco dos seis caminhos da
+  // issue com uma decisão só — e ela precisa vir ANTES do update, porque depois
+  // dele o que existe é a linha gravada.
+  //
+  // O motivo de ganho entra como `faltando` (chave `won_reason`) quando o funil
+  // pede e não veio: o MESMO contrato de `{chave, rotulo}` que a tela já sabe
+  // dialogar, em vez de um código paralelo que a tela teria de tratar à parte.
+  const settings = await settingsDoFunil(
+    supabase,
+    (lead as { pipeline_id: string }).pipeline_id,
+  );
+  const vereditoDeCampos = validaCamposExigidos({
+    lead: lead as Record<string, unknown>,
+    settingsDoFunil: settings,
+    camposComAnexo: await camposComAnexo(
+      supabase,
+      settings,
+      ctx.organization_id,
+      (lead as { id: string }).id,
+    ),
+    destino: { stageId: stage.id, desfecho: input.desfecho },
+    motivoDeGanho: input.desfecho === "won" ? input.motivo ?? null : null,
+  });
+  if (vereditoDeCampos.faltando.length > 0) {
+    const recusa = recusaDeCamposObrigatorios(
+      vereditoDeCampos.faltando,
+      ctx.idioma,
+    );
+    throw new ApiError(
+      422,
+      recusa.codigo,
+      { faltando: vereditoDeCampos.faltando },
+      ctx.requestId,
+      recusa.mensagem,
+    );
+  }
+  // Sem lista cadastrada o motivo de ganho é texto livre; com lista, só o que
+  // está nela passa — quem aplica é o servidor, porque para o GANHO não há
+  // trigger no banco (a CHECK da perda é `crm_leads_lost_reason_required`).
+  if (input.desfecho === "won") {
+    const recusaGanho = recusaDeMotivoDoGanho({
+      motivo: input.motivo,
+      settingsDoFunil: settings,
+      idioma: ctx.idioma,
+    });
+    if (recusaGanho) {
+      throw new ApiError(
+        422,
+        recusaGanho.codigo,
+        undefined,
+        ctx.requestId,
+        recusaGanho.mensagem,
+      );
+    }
+  }
+
+  const nextPosition = posicaoDeEntradaNaEtapa(
+    primeiraPosicao?.position_in_stage == null ? null : Number(primeiraPosicao.position_in_stage),
+  );
   const patch: Record<string, unknown> = {
     stage_id: terminalStageId,
     position_in_stage: nextPosition,
     updated_at: new Date().toISOString(),
   };
   if (input.desfecho === "lost") patch.lost_reason = input.motivo;
+  // O ganho espelha a perda na MESMA escrita: `won_reason` só entra quando há
+  // motivo (a coluna é nullable e sem CHECK — a obrigatoriedade é do funil,
+  // decidida acima, nunca do banco).
+  if (input.desfecho === "won" && input.motivo?.trim()) {
+    patch.won_reason = input.motivo.trim();
+  }
 
-  const { error: updErr } = await supabase
+  const escrita = supabase
     .from("crm_leads")
     .update(patch)
     .eq("id", input.leadId)
     .eq("organization_id", ctx.organization_id);
+  const { data: alcancadas, error: updErr } = input.travaOtimista
+    ? await escrita.eq("status", "open").eq("stage_id", (lead as { stage_id: string }).stage_id).select("id")
+    : await escrita;
 
   if (updErr) {
     // Rede de segurança (#917) — mesma dos outros três caminhos (arrasto, lote,
@@ -195,6 +301,9 @@ export async function encerraDemanda(
       throw new ApiError(422, recusa.codigo, undefined, ctx.requestId, recusa.mensagem);
     }
     throw new ApiError(500, "internal_error", undefined, ctx.requestId, updErr.message);
+  }
+  if (input.travaOtimista && (alcancadas ?? []).length === 0) {
+    throw conflitoDeEstado(ctx);
   }
 
   const { data: fresh } = await supabase
@@ -229,7 +338,7 @@ export async function encerraDemanda(
     // bloco "vocabulario de dominio persistido" em `lib/i18n/dicionario.ts`.
     reason:
       input.razaoNaTimeline ??
-      (input.desfecho === "won" ? "Ganho" : `Perdido — ${input.motivo}`),
+      (input.desfecho === "won" ? "Ganho" : razaoDaPerdaNaTimeline(input.motivo ?? "")),
     payload: {
       ...(input.payloadNaTimeline ?? {}),
       desfecho: input.desfecho,
@@ -262,6 +371,9 @@ export async function encerraDemanda(
       from_stage_id: (lead as { stage_id: string }).stage_id,
       to_stage_id: (stage as { id: string }).id,
       ...(input.desfecho === "lost" ? { lost_reason: input.motivo } : {}),
+      ...(input.desfecho === "won" && input.motivo?.trim()
+        ? { won_reason: input.motivo.trim() }
+        : {}),
     },
   });
 

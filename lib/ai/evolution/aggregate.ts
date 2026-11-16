@@ -23,12 +23,28 @@ export interface EvolutionInput {
    */
   skillInstalls: Array<{ updated_at: string; name: string }>;
   skillActivations: Array<{ created_at: string; skill_name: string }>;
-  routerDecisions: Array<{ created_at: string; outcome: string; intent_name: string | null }>;
+  /**
+   * `router_id` nulo é o turno de um NÚMERO SEM ROTEADOR (#4340): a linha existe
+   * para deixar rastro, não é decisão de roteador nenhum, e não entra em nenhuma
+   * conta deste painel — ver `decisoesDeRoteador` abaixo.
+   */
+  routerDecisions: Array<{
+    created_at: string;
+    outcome: string;
+    intent_name: string | null;
+    router_id?: string | null;
+  }>;
   knowledgeSearches: Array<{
     created_at: string;
     hits: number;
     top_score: number | null;
     threshold: number;
+    /**
+     * `'human'` = o atendente perguntou pela caixa "Acervo" da conversa (0484).
+     * Ausente conta como `'ai'`: é o default da coluna e o que toda linha
+     * anterior à 0484 foi.
+     */
+    author_kind?: string | null;
   }>;
   stageTransitions: Array<{ created_at: string; to_stage: string }>;
   costCents: number;
@@ -55,7 +71,10 @@ export interface EvolutionPayload {
     series: {
       skill_activations: Array<{ day: string; value: number }>;
       router_decisions: Array<{ day: string; value: number }>;
+      /** Só as buscas do AGENTE — é delas que os `gaps` de acervo falam. */
       knowledge_searches: Array<{ day: string; value: number }>;
+      /** Buscas da EQUIPE pela caixa "Acervo" da conversa: série própria, nunca somada à do agente. */
+      knowledge_searches_equipe: Array<{ day: string; value: number }>;
     };
     by_skill: Record<string, number>;
     by_intent: Record<string, number>;
@@ -147,9 +166,14 @@ export function aggregateEvolution(input: EvolutionInput): EvolutionPayload {
   // logo abaixo do limiar. É o sinal que separa "a base não tem isso" de "a base
   // tem e o corte está apertado demais" — dois problemas com consertos opostos.
   const PERTO = 0.1;
+  // A busca do ATENDENTE não entra aqui: a tela lê `knowledge_empty` como
+  // "pergunta de cliente que o agente não soube responder", e a pergunta
+  // exploratória de quem opera não é nenhuma das duas coisas.
+  const buscasDoAgente = input.knowledgeSearches.filter((k) => k.author_kind !== 'human');
+  const buscasDaEquipe = input.knowledgeSearches.filter((k) => k.author_kind === 'human');
   let nearMisses = 0;
   let empty = 0;
-  for (const k of input.knowledgeSearches) {
+  for (const k of buscasDoAgente) {
     if (k.hits > 0) continue;
     empty += 1;
     // ⚠️ COERÇÃO OBRIGATÓRIA. `top_score` e `threshold` são `numeric` no Postgres,
@@ -186,6 +210,12 @@ export function aggregateEvolution(input: EvolutionInput): EvolutionPayload {
     })
     .filter((p) => p.steps.length > 0);
 
+  // O número sem roteador grava uma linha `no_match` com `router_id` nulo a
+  // cada turno (#4340) — e esse é o estado NORMAL de quem nunca criou roteador.
+  // Contá-la aqui viraria "o roteador não entendeu N conversas" numa instalação
+  // que não tem roteador: lacuna falsa. Só decisão de roteador de verdade entra.
+  const decisoesDeRoteador = input.routerDecisions.filter((r) => r.router_id !== null);
+
   return {
     range: { from: toUtcDay(input.range.from), to: toUtcDay(input.range.to) },
     learned: {
@@ -197,15 +227,16 @@ export function aggregateEvolution(input: EvolutionInput): EvolutionPayload {
     activity: {
       series: {
         skill_activations: serie(days, input.skillActivations),
-        router_decisions: serie(days, input.routerDecisions),
-        knowledge_searches: serie(days, input.knowledgeSearches),
+        router_decisions: serie(days, decisoesDeRoteador),
+        knowledge_searches: serie(days, buscasDoAgente),
+        knowledge_searches_equipe: serie(days, buscasDaEquipe),
       },
       by_skill: contaPor(input.skillActivations, (r) => r.skill_name),
       by_intent: contaPor(
         // Só estes três outcomes carregam `intent_name` não-nulo (ver
         // `resolve-turn-agent.ts`); os demais já cairiam no filtro de null.
         // Nomear a lista deixa a regra explícita em vez de acidental.
-        input.routerDecisions.filter((r) => r.outcome === 'classified' || r.outcome === 'sticky' || r.outcome === 'reclassified'),
+        decisoesDeRoteador.filter((r) => r.outcome === 'classified' || r.outcome === 'sticky' || r.outcome === 'reclassified'),
         (r) => r.intent_name,
       ),
     },
@@ -222,8 +253,8 @@ export function aggregateEvolution(input: EvolutionInput): EvolutionPayload {
       pipelines_evaluated: input.pipelines.length,
       knowledge_near_misses: nearMisses,
       knowledge_empty: empty,
-      router_no_match: input.routerDecisions.filter((r) => r.outcome === 'no_match').length,
-      router_failed: input.routerDecisions.filter((r) => r.outcome === 'classifier_failed').length,
+      router_no_match: decisoesDeRoteador.filter((r) => r.outcome === 'no_match').length,
+      router_failed: decisoesDeRoteador.filter((r) => r.outcome === 'classifier_failed').length,
     },
   };
 }

@@ -14,6 +14,16 @@ const FONTE_INBOUND = fs.readFileSync(
   path.join(process.cwd(), "lib/agent-engine/agent/inbound-turn.ts"),
   "utf8",
 );
+/**
+ * O tamanho da janela é folga, não contrato: ele existe para o `moverParaHandoff…`
+ * estar NA MESMA região do `openedCaseThisTurn = true` (ou seja, depois do
+ * auto-abre-caso), não para medir distância entre linhas. A janela era 1800 desde
+ * a Wave 4; a #3725 pôs, entre o `openCase` e o `moverParaHandoff…`, a guarda
+ * `podeAbrirCasoNoFailsafe` (sem pedido explícito do cliente nem promessa
+ * explícita de humano, o caso não abre) e o `summary` da conversa. O que a
+ * asserção afirma não mudou: o caso aberto pelo fail-safe move o lead.
+ */
+const JANELA_DO_FAILSAFE = 2600;
 const FONTE_INGEST = fs.readFileSync(path.join(process.cwd(), "lib/waha/ingest.ts"), "utf8");
 
 describe("fiação — casePromiseGate recebe o nome do gerente do tenant", () => {
@@ -31,7 +41,7 @@ describe("fiação — caso humano aberto move o lead pra etapa de handoff", () 
   it("o fail-safe do case_promise (auto-abre-caso) chama moverParaHandoffBestEffort", () => {
     const i = FONTE_INBOUND.indexOf("chain.status === 'vetoed' && chain.code === 'case_promise_without_case'");
     expect(i).toBeGreaterThan(-1);
-    const janela = FONTE_INBOUND.slice(i, i + 1800);
+    const janela = FONTE_INBOUND.slice(i, i + JANELA_DO_FAILSAFE);
     expect(janela).toMatch(/openedCaseThisTurn = true;\s*\n\s*moverParaHandoffBestEffort\(/);
   });
 
@@ -89,16 +99,30 @@ describe("fiação — resposta manual pelo WhatsApp silencia o bot temporariame
    * cala porque ela mesma falou.
    *
    * `eco-do-envio-nao-silencia-o-bot.test.ts` mede o COMPORTAMENTO; esta guarda
-   * mede a FIAÇÃO — que a pausa está DENTRO do `if`, e não ao lado dele. Um
-   * refactor que desaninhasse as duas manteria os dois símbolos no arquivo e
-   * passaria pela asserção de presença acima.
+   * mede a FIAÇÃO — que a pausa está DENTRO da guarda de eco, e não ao lado
+   * dela. Um refactor que desaninhasse as duas manteria os dois símbolos no
+   * arquivo e passaria pela asserção de presença acima.
+   *
+   * Atualizada em 2026-09-24 (C-075): o `if` deixou de ser inline e passou a
+   * guardar os três desfechos (`#off` durável / `#on` devolve / mensagem normal
+   * pausa durável). O que a guarda protege continua o mesmo: TODA ação sobre o
+   * automático somente acontece se `!ehEco`.
    */
-  it("a pausa acontece DENTRO da guarda de eco, nunca ao lado dela", () => {
+  it("a ação sobre o automático acontece DENTRO da guarda de eco, nunca ao lado dela", () => {
     const i = FONTE_INGEST.indexOf("async function handleOutboundFromUserPhone(");
     const j = FONTE_INGEST.indexOf("async function handleAck(", i);
     const corpo = FONTE_INGEST.slice(i, j);
     expect(corpo).toMatch(
-      /if \(!\(await ehEcoDeEnvioNosso\([^)]*\)\)\) \{[\s\S]{0,300}?pausarIaPorAtendimentoManual\(/,
+      /const ehEco = await ehEcoDeEnvioNosso\([^)]*\);[\s\S]{0,80}?if \(!ehEco\) \{/,
     );
+    expect(corpo).toMatch(/if \(!ehEco\) \{[\s\S]{0,700}?pausarIaDuravelmente\(/);
+    // Janela de 900 (era 700): o #534 acrescentou `avisar` ao bloco da pausa,
+    // que é o que impede a falha de virar silêncio. A ordem provada é a mesma —
+    // a devolução continua DEPOIS das pausas e dentro da guarda.
+    expect(corpo).toMatch(/if \(!ehEco\) \{[\s\S]{0,900}?devolverAtendimentoAoAgente\(/);
+    // A pausa da mensagem comum também, e o interruptor do agente (que decide
+    // se a pausa é durável) é lido DENTRO da guarda — nunca para o eco.
+    expect(corpo).toMatch(/if \(!ehEco\) \{[\s\S]{0,2000}?pausarIaPorAtendimentoManual\(/);
+    expect(corpo).toMatch(/if \(!ehEco\) \{[\s\S]{0,400}?agenteAceitaComandoDeCelular\(/);
   });
 });

@@ -68,6 +68,25 @@ describe('aggregateEvolution', () => {
     expect(p.gaps.knowledge_empty).toBe(3);
   });
 
+  it('a busca do ATENDENTE não vira pergunta de cliente nem consulta do agente (#1877)', () => {
+    // Só a 0484 grava linha humana. Sem o filtro, a pergunta exploratória de
+    // quem opera, com hits=0, apareceria como "pergunta de cliente que o agente
+    // não soube responder" e inflaria "Consultas aos seus materiais".
+    const p = aggregateEvolution({
+      ...base(),
+      knowledgeSearches: [
+        { created_at: '2026-07-01T10:00:00Z', hits: 0, top_score: 0.68, threshold: 0.72, author_kind: 'ai' },
+        { created_at: '2026-07-01T11:00:00Z', hits: 0, top_score: 0.69, threshold: 0.72, author_kind: 'human' },
+        { created_at: '2026-07-02T11:00:00Z', hits: 0, top_score: null, threshold: 0.4 }, // linha antiga, sem a coluna
+      ],
+    });
+
+    expect(p.gaps.knowledge_empty).toBe(2);
+    expect(p.gaps.knowledge_near_misses).toBe(1);
+    expect(p.activity.series.knowledge_searches.map((d) => d.value)).toEqual([1, 1, 0]);
+    expect(p.activity.series.knowledge_searches_equipe.map((d) => d.value)).toEqual([1, 0, 0]);
+  });
+
   it('conta certo mesmo quando o driver entrega numeric como STRING', () => {
     // Este teste não é paranoia: a prova real da Task 2 mediu `top_score` voltando
     // como '0.910667' — `numeric` não tem parser default no node-postgres. Sem
@@ -200,5 +219,23 @@ describe('aggregateEvolution', () => {
     expect(p.activity.by_skill['__proto__']).toBe(1);
     expect(p.activity.by_skill['constructor']).toBe(1);
     expect(p.activity.by_skill['agendamento']).toBe(1);
+  });
+
+  it("turno de número SEM roteador (router_id nulo) não vira lacuna nem atividade do roteador (#4340)", () => {
+    const p = aggregateEvolution({
+      ...base(),
+      routerDecisions: [
+        // Um roteador de verdade que não casou: esta é a lacuna real.
+        { created_at: '2026-07-01T10:00:00Z', outcome: 'no_match', intent_name: null, router_id: 'router-1' },
+        // Número que nunca teve roteador: três turnos, três linhas de rastro.
+        { created_at: '2026-07-01T11:00:00Z', outcome: 'no_match', intent_name: null, router_id: null },
+        { created_at: '2026-07-01T12:00:00Z', outcome: 'no_match', intent_name: null, router_id: null },
+        { created_at: '2026-07-02T09:00:00Z', outcome: 'no_match', intent_name: null, router_id: null },
+      ],
+    });
+
+    expect(p.gaps.router_no_match).toBe(1);
+    const total = p.activity.series.router_decisions.reduce((soma, dia) => soma + dia.value, 0);
+    expect(total).toBe(1);
   });
 });

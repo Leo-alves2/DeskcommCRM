@@ -170,7 +170,7 @@ owner: Rafael Melgaço
 ### W-02 — Pedido de descadastro bloqueia o contato (era: "detecção STOP por regex")
 - **Origem**: Sub-PRD 03 §3.7
 - **Tipo**: Hard constraint
-- **Regra**: GIVEN mensagem inbound text; WHEN `ehPedidoDeOptOut(body)` — **palavra ISOLADA** (mensagem inteira = a palavra) **ou** verbo de cessação com **objeto de comunicação** ("parar de me mandar", "sair da lista", "cancelar inscrição"); THEN `contacts.is_blocked=true` + emitir activity `system.contact_blocked_by_stop`.
+- **Regra**: GIVEN mensagem inbound text; WHEN `ehPedidoDeOptOut(body)` — **palavra ISOLADA** (mensagem inteira = a palavra) **ou** verbo de cessação com **objeto de comunicação** ("parar de me mandar", "sair da lista", "cancelar a inscrição das mensagens"); THEN `contacts.is_blocked=true` + emitir activity `system.contact_blocked_by_stop`. A forma SEM objeto — "cancelar a inscrição", como "cancelar a assinatura" desde a #2886 — **escala** para um humano em vez de bloquear (#4579): num curso, é a matrícula, e `is_blocked` deixaria o aluno sem resposta.
 - **Por que deixou de ser regex de palavra solta** (2026-08-21): caçar a PALAVRA em qualquer posição bloqueava frase inocente na INGESTÃO, antes do modelo — e o bloqueio some a pessoa da conversa sem ninguém saber, com `blocked_reason='stop_keyword'` parecendo legítimo. Medido num corpus de 79 frases: a regra antiga produzia **12 falsos positivos** de nicho ("tem como parar a dor?", "posso sair antes das 15h?", "preciso sair mais cedo da consulta") e deixava passar **21 de 33 pedidos reais** ("não quero mais receber nada", "me tira da lista", "cancelar inscrição"). A regra nova: 0 falsos positivos, 33 de 33 pedidos.
 - **Onde ela mora, para não envelhecer aqui**: `lib/opt-out/deteccao.ts`. O vocabulário em vigor sai de `sed -n '/PALAVRAS_DE_OPT_OUT/,/^]/p' lib/opt-out/deteccao.ts | grep -E '^ *"'`; as frases de controle, de `tests/unit/opt-out-deteccao.test.ts`.
 - **Dois níveis, e a diferença importa**: `ehPedidoDeOptOut` (inequívoco) autoriza gravar `is_blocked`, que só uma pessoa desfaz. `ehOptOutProvavel` soma os ambíguos ("me deixa em paz") e é o sinal do runtime — para de responder e escala à Central, **sem** bloquear.
@@ -210,7 +210,8 @@ owner: Rafael Melgaço
 - **Origem**: Sub-PRD 03 §3.7
 - **Tipo**: Default com override
 - **Regra**: GIVEN `channel_session` com `created_at` < 30 dias; WHEN tentativa de envio outbound do dia ultrapassa o limite (default 300); THEN próximo envio é abortado com erro `daily_limit_exceeded`.
-- **Enforcement**: Worker de envio + counter Redis por sessão.
+- **O que conta**: só o que o número INICIA — primeira mensagem, follow-up, prospecção e campanha. A resposta a quem escreveu (turno de resposta, resposta a caso, resposta aprovada no modo assistido, aviso de escalação de resposta e aviso fora do horário) não conta e não é barrada pelo limite; ela segue presa à janela de resposta e ao intervalo entre mensagens. Decisão do dono em 31/10/2026 (doc 246, opção A; migration 9061, `pacing_ledger.resposta`). Prospecção prevalece: abordagem fria nunca é tratada como resposta.
+- **Enforcement**: `decidePacing` (`lib/agent-engine/pacing/engine.ts`) sobre a contagem de `pacing_ledger` em que `resposta = false`.
 - **Override**: Tenant admin com aprovação de super-admin pode aumentar limite — ação auditada com justificativa.
 
 ### W-07 — Janela horária default 7h-22h, domingo LIBERADO
@@ -254,8 +255,9 @@ owner: Rafael Melgaço
 - **Origem**: Sub-PRD 03 §3.10
 - **Tipo**: Hard constraint
 - **Regra**: GIVEN mensagem com `status='sending'`; WHEN `created_at < now() - 5 min`; THEN cron muda pra `status='failed'`, emite event `message.failed` e notifica atendente se modo interativo.
-- **Enforcement**: Cron de 1 min — `app/api/v1/cron/recover-stuck-messages/route.ts`, agendado no serviço `scheduler` do `docker-compose.prod.yml`. Implementado em 2026-08-05 (issue #129); antes disso a regra existia só neste catálogo. A notificação é um item `message_send_stuck` na Central de avisos, **um por organização por rodada** (um por mensagem enterraria a Central justo no dia em que ela precisa ser lida). Guardado por `tests/unit/recover-stuck-messages.test.ts`.
-- **Exceção**: `status='queued'` não entra. Esse estado tem dono — o agent-engine reagenda o envio por `SEND_QUEUED_RETRY_MS` enquanto a sessão do canal não está WORKING —, e falhá-lo em 5 min perderia mensagem que ia sair. `sending` é que não tem dono nenhum.
+- **Enforcement**: Cron de 5 min (`*/5`, `docker/scheduler/entrypoint.sh`; pior caso de cerca de 10 min entre a mensagem travar e virar `failed`) — `app/api/v1/cron/recover-stuck-messages/route.ts`, agendado no serviço `scheduler` do `docker-compose.prod.yml`. Implementado em 2026-08-05 (issue #129); antes disso a regra existia só neste catálogo. A notificação é um item `message_send_stuck` na Central de avisos, **um por organização por rodada** (um por mensagem enterraria a Central justo no dia em que ela precisa ser lida). Guardado por `tests/unit/recover-stuck-messages.test.ts`.
+- **Exceção**: `status='queued'` não entra. Esse estado tem dono, e falhá-lo em 5 min perderia mensagem que ia sair: no canal por QR, o resgate do watchdog (`redriveQueued`, `lib/agent-engine/edge/crm/session-reconciler.ts`) reenvia quando a sessão volta a WORKING; a mensagem da pessoa ou do agente que o canal mandou DESACELERAR (`queued_reason` = o `throttled` do adapter) volta pelo reenvio desacelerado (`lib/messaging/reenvio-desacelerado.handler.ts`, evento `message.throttled_resend_requested`); a de campanha, automação ou integração nem chega a `queued` por esse motivo — segue `failed`, que é o que o laço próprio dela lê (`reenvioDesaceleradoAtende` em `lib/messaging/reenvio-desacelerado.ts`). `sending` é que não tem dono nenhum. (Esta linha dizia que "o agent-engine reagenda o envio por `SEND_QUEUED_RETRY_MS`"; medido em 27/10/2026, o ramo `queued` de `applySendOutcome` não tem chamador no turno do agente — confira com `grep -n "applySendOutcome(" -r lib/agent-engine/agent`.)
+- **Rede da espera**: a `queued` não muda de status, mas também não fica invisível. Outbound `queued` vencida numa conexão que JÁ VOLTOU a WORKING vira um aviso `message_send_stuck` na Central: 15 min (`ESPERA_ESQUECIDA_MS`) para a que esperava a conexão (`channel_session_not_working`), 50 min (`ESPERA_COM_TENTATIVA_MS`) para qualquer outra, que pode ter nova tentativa agendada, e nenhuma acima de 24 h (`ESPERA_TETO_MS`). Um aviso por organização enquanto o mesmo estiver aberto; resolvido, só mensagem que vencer depois dele reabre. É a rede de quem não tem dono — a mensagem de pessoa que esperava a conexão voltar num canal que o resgate do watchdog não alcança — e do reenvio desacelerado cujo pedido se perdeu. Enquanto a conexão segue fora, não avisa (repetiria o alerta de queda). Não reenvia. Guardado por `tests/unit/espera-esquecida-vira-aviso.test.ts`.
 
 ---
 
@@ -453,6 +455,7 @@ owner: Rafael Melgaço
 - **Regra**: GIVEN tenant com `ai_budget_cents` configurado; WHEN consumo do mês atinge 80%; THEN alarme + email pro admin. Em 100%; THEN bot é throttled (default: pausa); 4 gatilhos de handoff continuam funcionando (cliente sempre tem humano).
 - **Enforcement**: Worker IA + cron de billing.
 - **Override**: Tenant pode escolher comportamento em 100%: pausar bot vs continuar (paga overage). Default: pausar.
+- **Estado**: o orçamento que a organização escolhe mora na tabela `ai_budgets` (`app/api/v1/ai/budget/route.ts`), não em `organizations.ai_budget_cents` — essa coluna nunca teve leitor e saiu na migration 0583 (`grep -c "drop column if exists ai_budget_cents" supabase/baseline.sql` devolve 1 enquanto a remoção estiver no baseline). O teto de IA que o revendedor põe no plano é outra régua: `cobranca_planos.teto_ia_usd_cents`.
 
 ### IA-11 — Embeddings de catálogo Nuvemshop são re-indexados em mudança
 - **Origem**: Sub-PRD 05 §3.5
@@ -471,6 +474,7 @@ owner: Rafael Melgaço
 - **Regra**: GIVEN qualquer ação que consome recurso (mensagem enviada/recebida, chamada LLM, storage usage); WHEN ocorre; THEN entrada em `usage_events` com `tenant_id`, `metric_type`, `quantity`, `cost_cents` (calculado), `recorded_at`.
 - **Enforcement**: Workers de cada subsistema (WhatsApp send/recv, IA invocation, storage upload).
 - **Exceção**: Nenhuma.
+- **Estado**: **não construída.** A tabela `usage_events` não existe (`grep -c usage_events supabase/baseline.sql`). O custo por organização que existe é o de IA, em `llm_calls.cost_cents` (B-02). A cobrança do revendedor ([ADR-0004](../adr/0004-cobranca-do-revendedor.md)) cobra plano fixo, não consumo, e não depende desta regra; para o operador de agentes, a unidade decidida é retainer, não consumo (`docs/doctrine/operacao-de-agentes.md` §0).
 
 ### B-02 — Custo de IA é rateado por tenant
 - **Origem**: Sub-PRD 05 §3.9 + IA-10
@@ -478,6 +482,7 @@ owner: Rafael Melgaço
 - **Regra**: GIVEN invocação LLM via Vercel AI Gateway; WHEN o evento de billing chega do Gateway; THEN o custo é atribuído ao `tenant_id` do agent que originou a chamada.
 - **Enforcement**: Worker de billing IA.
 - **Exceção**: Custos administrativos da plataforma (super-admin testando, suporte) são debitados ao tenant `internal_deskcomm`.
+- **Estado**: cumprida por outro mecanismo. Não há evento de billing vindo do Gateway nem worker de billing: o próprio runtime grava o custo de cada chamada em `llm_calls.cost_cents`, com o `organization_id` de onde ela roda (`lib/agent-engine/edge/llm/run-model-call.ts`, `lib/ai/log-invocation.ts`), em centavos de **dólar**, e `fn_gasto_de_ia_do_mes` é a única soma (vigiada por `tests/unit/orcamento-uma-regua-de-gasto.test.ts`). A exceção não existe: não há tenant `internal_deskcomm` (`grep -rn internal_deskcomm lib app workers supabase/baseline.sql`). É essa soma que o teto de IA do plano do revendedor consome ([ADR-0004](../adr/0004-cobranca-do-revendedor.md)).
 
 ### B-03 — Storage de mídia tem retenção configurável por tenant
 - **Origem**: PRD-Mestre §7.3
@@ -485,6 +490,7 @@ owner: Rafael Melgaço
 - **Regra**: GIVEN mídia em `whatsapp-media` bucket; WHEN `created_at < now() - tenant.media_retention_days` (default 365); THEN cron `prune-old-media` move pra cold storage S3 (ou deleta se `tenant.cold_storage_disabled=true`).
 - **Enforcement**: Cron diário.
 - **Override**: Tenant pode aumentar retenção (paga storage extra) ou diminuir (mín 90d em modo BPO; sem mín em modo SaaS futuro).
+- **Estado**: cumprida desde a migration 0432, **sem camada cold/S3** — o arquivo vencido é removido (a mensagem fica, com «Mídia indisponível»), com piso de 30 dias, o mesmo do formulário. Junto sai o arquivo órfão de conversa apagada. Quem enfileira é `fn_enfileirar_midia_vencida`, chamada pelo cron `media-retention`; quem remove é o `storage-redaction`, pela `storage_redaction_queue`. Para ver o horário em vigor: `grep -n media-retention docker/scheduler/entrypoint.sh`.
 
 ### B-04 — Quota de chamadas API por tenant: 100 RPS no MVP
 - **Origem**: Sub-PRD 01 §4.2
@@ -492,6 +498,7 @@ owner: Rafael Melgaço
 - **Regra**: GIVEN tenant fazendo chamadas via API; WHEN ultrapassa 100 RPS; THEN próxima chamada retorna 429 com `Retry-After` e `X-RateLimit-*` headers.
 - **Enforcement**: Upstash Redis sliding window.
 - **Override**: Cliente enterprise pode contratar plano com RPS maior; ajuste em `tenants.rate_limit_config`.
+- **Estado**: **não cumprida como escrita.** A coluna `organizations.rate_limit_rps` (padrão 100) nunca teve leitor e saiu na migration 0583; `tenants.rate_limit_config` não existe; nenhum teto de 100 RPS por organização é aplicado. O teto real da API é de escrita, por token e por organização, numa janela fixa (`grep -n 'TETO_\|JANELA_' lib/mcp/rate-limit.ts`), aplicado rota a rota por quem chama `tetoDeEscritaDoToken` (`lib/api/auth-dual.ts`) ou o contador de `/api/v1/messages`; nem toda rota com Bearer o chama (`grep -rlE 'tetoDeEscritaDoToken|TETO_DE_ESCRITA' app/api`). A cobrança do revendedor ([ADR-0004](../adr/0004-cobranca-do-revendedor.md)) não vende nem limita RPS; a coluna sem leitor saiu com ela (`grep -c "drop column if exists rate_limit_rps" supabase/baseline.sql` devolve 1 enquanto a remoção estiver no baseline; o `CREATE TABLE` do dump continua citando o nome).
 
 ### B-05 — Sync inicial Nuvemshop respeita rate limit do upstream
 - **Origem**: Sub-PRD 06 §3.11

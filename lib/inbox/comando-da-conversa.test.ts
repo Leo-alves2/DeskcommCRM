@@ -114,6 +114,26 @@ describe("comandoDaConversa — o automático está ativo?", () => {
     expect(r.motivo).toBe("atendente_no_comando");
   });
 
+  it("silêncio durável sem dono: pausa genérica — a ação é devolver", () => {
+    const r = comandoDaConversa(fatos({ bot_silenced_until: "infinity" }), AGORA);
+    expect(r.motivo).toBe("pausado");
+    expect(r.travaVigente).toBe(true);
+  });
+
+  it("C-075: pausa por resposta no CELULAR tem motivo próprio, e a trava é devolvível", () => {
+    const r = comandoDaConversa(
+      fatos({
+        status: "claimed",
+        bot_silenced_until: "infinity",
+        last_handoff_reason: "Atendimento manual pelo canal (resposta fora do CRM)",
+      }),
+      AGORA,
+    );
+    expect(r.motivo).toBe("atendimento_pelo_celular");
+    expect(r.travaVigente).toBe(true);
+    expect(ROTULO_DO_MOTIVO.atendimento_pelo_celular).toMatch(/#on/i);
+  });
+
   it("valor ilegível falha FECHADA: trata como calado, nunca afirma que está ativo", () => {
     const r = comandoDaConversa(fatos({ bot_silenced_until: "isto-nao-e-data" }), AGORA);
     expect(r.automaticoAtivo).toBe(false);
@@ -149,6 +169,46 @@ describe("o que a tela NÃO pode afirmar", () => {
     // impressão, que é P0.
     const r = comandoDaConversa(fatos({ automaticoDaOrg: false }), AGORA);
     expect(r.comando).toEqual({ quem: "ninguem" });
+  });
+
+  it("⭐ sem agente NESTE número: é fila ('aguardando'), não 'ninguem' nem 'automatico' (#4012)", () => {
+    // O caso medido em produção: a organização TEM agente, publicado em outro
+    // número (ou o canal em pré-go-live com o contato fora da lista). Ninguém
+    // vai responder esta conversa — e `ninguem` esconderia a conversa da Fila,
+    // que é onde o atendente a encontra.
+    const r = comandoDaConversa(fatos({ automaticoDaConversa: false }), AGORA);
+    expect(r.comando).toEqual({ quem: "aguardando" });
+    expect(r.automaticoAtivo).toBe(false);
+    // Não há automático PAUSADO a explicar: não há automático aqui.
+    expect(r.motivo).toBeNull();
+  });
+
+  it("organização SEM agente e número sem agente: 'ninguem' — a mesma ordem do wrapper do banco (#4012)", () => {
+    // Organização sem agente implica número sem agente, então os dois fatos
+    // chegam `false` juntos. O banco pergunta primeiro pela organização
+    // (`fn_org_tem_automatico`) e responde `ninguem`; a tela, que recalcula o
+    // comando com os dois fatos, tem de dizer o mesmo. Os dois valores estão em
+    // `comandosDaFila`: a conversa aparece na Fila de qualquer jeito.
+    const r = comandoDaConversa(fatos({ automaticoDaOrg: false, automaticoDaConversa: false }), AGORA);
+    expect(r.comando).toEqual({ quem: "ninguem" });
+    expect(r.automaticoAtivo).toBe(false);
+  });
+
+  it("sem agente no número e silêncio vigente: continua fila, e o motivo é o silêncio", () => {
+    const r = comandoDaConversa(fatos({ automaticoDaConversa: false, bot_silenced_until: "infinity" }), AGORA);
+    expect(r.comando).toEqual({ quem: "aguardando" });
+    expect(r.motivo).toBe("pausado");
+  });
+
+  it("com agente no número (true) nada muda: segue 'automatico'", () => {
+    const r = comandoDaConversa(fatos({ automaticoDaConversa: true }), AGORA);
+    expect(r.comando).toEqual({ quem: "automatico" });
+    expect(r.automaticoAtivo).toBe(true);
+  });
+
+  it("sem agente no número, mas COM dono humano: quem manda é a pessoa", () => {
+    const r = comandoDaConversa(fatos({ automaticoDaConversa: false, assigned_to_user_id: ATENDENTE }), AGORA);
+    expect(r.comando).toEqual({ quem: "humano", userId: ATENDENTE, nome: null });
   });
 
   it("'não sei' NÃO vira 'não há': leitura ausente mantém o comportamento anterior", () => {
@@ -263,10 +323,11 @@ describe("o espelho entre a tela e o motor", () => {
     expect(Object.keys(ROTULO_DO_COMANDO).sort()).toEqual(
       ["aguardando", "automatico", "encerrada", "humano", "ninguem"],
     );
-    // Cinco desde 2026-08-30: `contato_descadastrado` entrou junto com
-    // `is_blocked` nos fatos. O número fica escrito porque motivo novo tem de
-    // ganhar rótulo no mesmo commit — um motivo sem rótulo imprime a chave crua.
-    expect(Object.keys(ROTULO_DO_MOTIVO)).toHaveLength(5);
+    // Seis desde 2026-09-24: `atendimento_pelo_celular` (C-075) entrou junto com
+    // a pausa durável por resposta no celular. O número fica escrito porque motivo
+    // novo tem de ganhar rótulo no mesmo commit — um motivo sem rótulo imprime a
+    // chave crua.
+    expect(Object.keys(ROTULO_DO_MOTIVO)).toHaveLength(6);
     // "IA" no rótulo colidiria com o léxico que o produto já fixou em quatro
     // arquivos e que `handoff-por-orcamento.test.ts` usa como sabotagem-controle.
     for (const rotulo of Object.values(ROTULO_DO_MOTIVO)) {
@@ -327,17 +388,46 @@ describe("o que entrou quando o banco passou a calcular o mesmo comando", () => 
     expect(r.motivo).toBe("contato_travado");
   });
 
-  it("a fila pede 'aguardando' — e 'automatico' também quando a org não tem robô", () => {
-    expect(comandosDaFila(true)).toEqual(["aguardando"]);
-    expect(comandosDaFila(undefined)).toEqual(["aguardando"]);
-    // Sem automático de pé, `automatico` não descreve ninguém: essas conversas
-    // estão esperando gente, e deixá-las fora faria a Fila de uma instalação
-    // nova nascer vazia com clientes sem resposta.
-    expect(comandosDaFila(false)).toEqual(["aguardando", "automatico"]);
+  it("a fila pede 'aguardando' E 'ninguem' — e 'automatico' só na janela do deploy", () => {
+    // `ninguem` é conversa que espera gente em QUALQUER organização: o banco só a
+    // nomeia assim quando não há agente no ar (issue #4012), e ela não pode sumir
+    // da Fila — trocar a mentira por um sumiço é pior que a mentira.
+    expect(comandosDaFila(true)).toEqual(["aguardando", "ninguem"]);
+    expect(comandosDaFila(undefined)).toEqual(["aguardando", "ninguem"]);
+    // `automatico` sobrevive à virada por um motivo com prazo: entre o deploy deste
+    // código e a migration aplicada, o banco ainda devolve `automatico` para essas
+    // conversas, e sem o valor extra a Fila de uma instalação sem IA nasceria vazia.
+    expect(comandosDaFila(false)).toEqual(["aguardando", "ninguem", "automatico"]);
   });
 
-  it("o vocabulário do banco tem QUATRO — 'ninguem' é renomeação de TS, não estado", () => {
-    expect([...COMANDOS_DO_BANCO]).toEqual(["humano", "automatico", "aguardando", "encerrada"]);
-    expect(COMANDOS_DO_BANCO as readonly string[]).not.toContain("ninguem");
+  it("o vocabulário do banco tem CINCO — 'ninguem' passou a ser resposta do SQL (#4012)", () => {
+    expect([...COMANDOS_DO_BANCO]).toEqual([
+      "humano",
+      "automatico",
+      "aguardando",
+      "encerrada",
+      "ninguem",
+    ]);
+    // E ele continua sendo o MESMO estado do TS: o rótulo da tela existe desde
+    // antes, e é o que o banco agora pode pedir.
+    expect(ROTULO_DO_COMANDO.ninguem).toBe("Sem atendente");
+  });
+});
+
+describe("comandoDaConversa — grupo de WhatsApp (I3)", () => {
+  it("grupo sem dono é da fila HUMANA ('aguardando'), nunca 'Automático atendendo'", () => {
+    const r = comandoDaConversa(fatos({ is_group: true, automaticoDaOrg: true }), AGORA);
+    expect(r.comando.quem).toBe("aguardando");
+    expect(r.automaticoAtivo).toBe(false);
+    // Nada de "Devolver ao automático" num grupo, nem motivo de automático pausado.
+    expect(r.travaVigente).toBe(false);
+    expect(r.motivo).toBeNull();
+  });
+  it("grupo com dono continua nomeando o atendente; grupo fechado continua encerrado", () => {
+    expect(comandoDaConversa(fatos({ is_group: true, assigned_to_user_id: ATENDENTE }), AGORA).comando.quem).toBe("humano");
+    expect(comandoDaConversa(fatos({ is_group: true, status: "closed" }), AGORA).comando.quem).toBe("encerrada");
+  });
+  it("controle: a mesma conversa sem ser grupo é do automático", () => {
+    expect(comandoDaConversa(fatos({ is_group: false, automaticoDaOrg: true }), AGORA).comando.quem).toBe("automatico");
   });
 });

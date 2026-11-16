@@ -26,6 +26,11 @@ export interface BuildNativeMediaPartsArgs {
   provider: string;
   model: string;
   multimodalInput: boolean;
+  /**
+   * O agente vê imagens (`image_vision_enabled`, 9108)? `false` = nenhuma imagem
+   * nativa (o PDF segue a regra dele). Ausente = vê.
+   */
+  verImagens?: boolean;
   admin: SupabaseClient;
   /** teto de mídias anexadas (default 1: só a inbound mais recente). */
   maxItems?: number;
@@ -62,7 +67,9 @@ export async function buildNativeMediaParts(args: BuildNativeMediaPartsArgs): Pr
     return (data?.supports_vision as boolean | null) ?? null;
   };
   const caps = {
-    image: (await visaoEmVigor({ provider: args.provider, modelId: args.model, catalogo })).enxerga,
+    image:
+      args.verImagens !== false &&
+      (await visaoEmVigor({ provider: args.provider, modelId: args.model, catalogo })).enxerga,
     pdf: modelCapabilities(args.provider, args.model).pdf,
   };
   if (!caps.image && !caps.pdf) return [];
@@ -75,6 +82,10 @@ export async function buildNativeMediaParts(args: BuildNativeMediaPartsArgs): Pr
   // no máximo 1 item — maxItems fica só como teto declarado na assinatura.
   const latestInbound = [...args.messages].reverse().find((m) => m.direction === "inbound");
   const candidates = latestInbound?.media_storage_path ? [latestInbound].slice(0, maxItems) : [];
+  // A retenção (migration 0557, #1534) anula `media_storage_path` E `media_url`
+  // ao expirar, então quem expirou nem entra em `candidates` — o download abaixo
+  // é inalcançável para mídia podada. O comentário fica porque a guarda é
+  // ESTRUTURAL (coluna nula), não uma checagem que alguém possa esquecer.
 
   const parts: NativeMediaPart[] = [];
   // ponytail: esta camada é aprimoramento, não caminho crítico — o derivado textual

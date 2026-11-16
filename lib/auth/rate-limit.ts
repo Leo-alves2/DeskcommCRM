@@ -23,6 +23,7 @@ import { createHash } from "node:crypto";
 import { headers } from "next/headers";
 
 import { checkRateLimit, peekRateLimit } from "@/lib/ai/dispatcher/rate-limit";
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 
 export interface AuthRateLimits {
   /** Tentativas por IP na janela. */
@@ -32,24 +33,6 @@ export interface AuthRateLimits {
   windowSec: number;
 }
 
-/**
- * IP do cliente, ou `null` quando não dá para saber.
- *
- * `x-forwarded-for` é o header do proxy; `x-real-ip` é o que Nginx costuma setar
- * sozinho em configurações simples. Nenhum dos dois é confiável contra spoofing —
- * mas o uso aqui é rate limit, onde forjar o header só isola o atacante em outro
- * balde, nunca dá acesso.
- *
- * `null` em vez de uma string sentinela: "não sei de onde veio" precisa ser
- * inexprimível como se fosse uma origem, senão vira balde compartilhado.
- */
-async function clientIp(): Promise<string | null> {
-  const hdrs = await headers();
-  const encaminhado = hdrs.get("x-forwarded-for")?.split(",")[0]?.trim();
-  if (encaminhado) return encaminhado;
-  const real = hdrs.get("x-real-ip")?.trim();
-  return real || null;
-}
 
 function opaque(value: string): string {
   return createHash("sha256").update(value.trim().toLowerCase()).digest("hex").slice(0, 32);
@@ -66,7 +49,7 @@ export async function authRateLimited(
   identifier: string | null,
   limits: AuthRateLimits,
 ): Promise<boolean> {
-  const ip = await clientIp();
+  const ip = ipDoCliente(await headers());
 
   // SEM IP identificável, o limite por IP não entra — e isto é decisão de
   // segurança, não relaxamento.
@@ -143,6 +126,7 @@ export const AUTH_LIMITS = {
   // usado UMA vez na vida de uma conta — 3 por hora por identidade já é
   // folga para quem errou o nome duas vezes.
   org_recovery: { ip: 5, id: 3, windowSec: 3600 },
+  mfa: { ip: 30, id: 3, windowSec: 60 },
 } satisfies Record<string, AuthRateLimits>;
 
 export const __LOGIN_IP_DEFAULT_PARA_TESTE = LOGIN_IP_DEFAULT;
@@ -168,4 +152,165 @@ export async function contaBloqueadaPorFalhas(email: string, limits: AuthRateLim
 export async function registrarFalhaDeLogin(email: string, limits: AuthRateLimits): Promise<void> {
   if (limits.id === undefined) return;
   await checkRateLimit(`auth:login_fail:id:${opaque(email)}`, limits.id, limits.windowSec);
+}
+
+/**
+ * Bloqueio por falha de TOKEN DE API (`dsk_...`) — o MCP não tinha nenhum
+ * (issue #1447).
+ *
+ * O login já contava falhas; o token de máquina, não. `validateBearerToken`
+ * recusava e seguia, e cada recusa custava um lookup em `api_tokens` — então a
+ * mesma origem podia varrer tokens para sempre a custo zero. Dois baldes,
+ * porque são dois ataques diferentes:
+ *
+ *   - por ORIGEM (`api_token_fail:ip`): quem ADIVINHA — cabeçalho ausente ou
+ *     torto, `dsk_` malformado, hash desconhecido. É o freio de quem varre de
+ *     um lugar só.
+ *   - pelo VALOR APRESENTADO (`api_token_fail:token`, hash SHA256 do que veio
+ *     no header): quem REPETE o mesmo chute, ou o mesmo token já morto
+ *     (revogado, expirado), trocando de IP a cada tentativa — o espelho do
+ *     caso acima, que o balde por IP vê como "1 falha por IP" e não barra.
+ *
+ * `revoked`/`expired` NÃO debitam o balde por origem: quem apresenta um token
+ * que existiu não está adivinhando, e transformar cliente desatualizado em
+ * bloqueio por IP puniria NAT corporativo — exatamente o que `authRateLimited`
+ * evita. Eles debitam só o balde do valor apresentado, que não afeta mais
+ * ninguém.
+ *
+ * `lookup_failed` não conta em balde nenhum: a falha é nossa (banco fora), e
+ * indisponibilidade de infraestrutura não pode virar bloqueio de cliente.
+ *
+ * Sem Redis de pé a contagem cai para a memória do processo — vira teto por
+ * instância, o mesmo aviso que o resto deste módulo já carrega. As funções
+ * aqui falham ABERTO: erro ao consultar o teto não pode virar 500 no meio da
+ * autenticação — o que ele protege é custo, não acesso.
+ */
+export interface TokenFailureLimits {
+  /** Teto por origem, por janela. */
+  ip: number;
+  /** Teto por valor apresentado, por janela. */
+  token: number;
+  windowSec: number;
+}
+
+export const TOKEN_FAILURE_LIMITS: TokenFailureLimits = { ip: 30, token: 5, windowSec: 300 };
+
+export interface FalhaDeTokenOpcoes {
+  /** `true` (default) = também debita o balde por origem: quem ADIVINHOU. */
+  contaNoIp?: boolean;
+}
+
+function tokenFailureIpKey(ip: string): string {
+  return `api_token_fail:ip:${opaque(ip)}`;
+}
+
+function tokenFailureValueKey(plaintext: string): string {
+  return `api_token_fail:token:${opaque(plaintext)}`;
+}
+
+/**
+ * `true` = teto estourado, barre ANTES de resolver o token.
+ *
+ * Consulta sem incrementar: quem incrementa é `registrarFalhaDeToken`, e só
+ * quando a tentativa realmente falhou. Acerto não paga imposto.
+ */
+export async function tokenFailureLimited(
+  plaintext: string | null,
+  limits: TokenFailureLimits = TOKEN_FAILURE_LIMITS,
+): Promise<boolean> {
+  try {
+    const ip = ipDoCliente(await headers());
+    if (ip !== null && (await peekRateLimit(tokenFailureIpKey(ip), limits.windowSec)) >= limits.ip) {
+      return true;
+    }
+    if (
+      plaintext !== null &&
+      (await peekRateLimit(tokenFailureValueKey(plaintext), limits.windowSec)) >= limits.token
+    ) {
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error(
+      "[auth.rate-limit] teto de token indisponível (falha aberta)",
+      err instanceof Error ? err.message : err,
+    );
+    return false;
+  }
+}
+
+/**
+ * Registra a tentativa que FALHOU.
+ *
+ * @param plaintext valor apresentado; `null` quando não veio token nenhum
+ *   (cabeçalho ausente/malformado) — aí só o balde por origem existe.
+ */
+export async function registrarFalhaDeToken(
+  plaintext: string | null,
+  opcoes: FalhaDeTokenOpcoes = {},
+  limits: TokenFailureLimits = TOKEN_FAILURE_LIMITS,
+): Promise<void> {
+  const contaNoIp = opcoes.contaNoIp ?? true;
+  try {
+    if (contaNoIp) {
+      const ip = ipDoCliente(await headers());
+      if (ip !== null) {
+        await checkRateLimit(tokenFailureIpKey(ip), limits.ip, limits.windowSec);
+      }
+    }
+    if (plaintext !== null) {
+      await checkRateLimit(tokenFailureValueKey(plaintext), limits.token, limits.windowSec);
+    }
+  } catch (err) {
+    console.error(
+      "[auth.rate-limit] falha ao registrar tentativa de token (falha aberta)",
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+/** Janela longa do segundo fator: só por usuário (o teto por IP é o da janela curta). */
+const MFA_DIARIO = { id: 15, windowSec: 86400 } as const;
+
+/**
+ * Bloqueio por FALHA no segundo fator (MFA/TOTP), contado no servidor e não
+ * no navegador — a mesma dupla proteção do `login`:
+ *  - janela curta (`AUTH_LIMITS.mfa`, 3 falhas / 60s por usuário e 30 por IP);
+ *  - janela diária (`MFA_DIARIO`, 15 falhas / 24h por usuário).
+ *
+ * Toda tela que confere o código do segundo fator consulta e alimenta este
+ * mesmo balde: `verifyMfa` e `updatePassword`.
+ */
+export async function mfaBloqueadoPorFalhas(
+  userId: string,
+  limits: AuthRateLimits = AUTH_LIMITS.mfa,
+  diario: { id: number; windowSec: number } = MFA_DIARIO,
+): Promise<boolean> {
+  const ip = ipDoCliente(await headers());
+  if (ip !== null) {
+    const atualIp = await peekRateLimit(`auth:mfa_fail:ip:${opaque(ip)}`, limits.windowSec);
+    if (atualIp >= limits.ip) return true;
+  }
+  if (limits.id !== undefined) {
+    const atualId = await peekRateLimit(`auth:mfa_fail:id:${opaque(userId)}`, limits.windowSec);
+    if (atualId >= limits.id) return true;
+  }
+  const atualDia = await peekRateLimit(`auth:mfa_fail_daily:id:${opaque(userId)}`, diario.windowSec);
+  return atualDia >= diario.id;
+}
+
+/** Registra uma tentativa de MFA/TOTP que falhou no contador do servidor. */
+export async function registrarFalhaDeMfa(
+  userId: string,
+  limits: AuthRateLimits = AUTH_LIMITS.mfa,
+  diario: { id: number; windowSec: number } = MFA_DIARIO,
+): Promise<void> {
+  const ip = ipDoCliente(await headers());
+  if (ip !== null) {
+    await checkRateLimit(`auth:mfa_fail:ip:${opaque(ip)}`, limits.ip, limits.windowSec);
+  }
+  if (limits.id !== undefined) {
+    await checkRateLimit(`auth:mfa_fail:id:${opaque(userId)}`, limits.id, limits.windowSec);
+  }
+  await checkRateLimit(`auth:mfa_fail_daily:id:${opaque(userId)}`, diario.id, diario.windowSec);
 }

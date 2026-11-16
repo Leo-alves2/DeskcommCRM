@@ -2,6 +2,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "@/lib/api/client";
 import { liberarEcoLocal, marcarEcoLocal } from "@/lib/kanban/local-echo";
+import { fundeRespostaNoCard } from "@/lib/kanban/owner";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import type { Lead } from "@/lib/types/leads";
 import type { BoardData } from "@/lib/kanban/types";
@@ -31,7 +32,10 @@ function gravaLeadNoQuadro(
   if (!lead) return;
   qc.setQueryData<BoardData>(queryKey, (atual) =>
     atual
-      ? { ...atual, leads: atual.leads.map((l) => (l.id === leadId ? { ...l, ...lead } : l)) }
+      ? {
+          ...atual,
+          leads: atual.leads.map((l) => (l.id === leadId ? fundeRespostaNoCard(l, lead) : l)),
+        }
       : atual,
   );
 }
@@ -75,6 +79,56 @@ export function useLoseLead(pipelineId: string) {
     },
     onSuccess: (res, { leadId }) => {
       gravaLeadNoQuadro(qc, queryKey, leadId, res?.data);
+    },
+    onError: showApiError,
+    onSettled: (_data, _err, { leadId }) => {
+      liberarEcoLocal(leadId);
+      qc.invalidateQueries({ queryKey });
+    },
+  });
+}
+
+interface MoveToPipelineArgs {
+  leadId: string;
+  targetPipelineId: string;
+  /**
+   * A etapa de ENTRADA no funil destino (issue #3643). Ausente ou `null` é o
+   * comportamento de sempre: o servidor escolhe a primeira etapa aberta
+   * (`escolheEtapaDeDestino`). Não vai como `null` no corpo porque o schema
+   * aceita `stage_id` só como uuid — e porque "não escolhi" não é um pedido.
+   */
+  targetStageId?: string | null;
+}
+
+/**
+ * Levar o negócio para OUTRO funil — `POST /api/v1/leads/[id]/clone`.
+ *
+ * A origem (ESTE quadro) fecha como perdida com o motivo canônico
+ * `moved_to_another_pipeline` (o servidor grava sozinho quando nenhum motivo é
+ * enviado — `lib/leads/motivo-da-perda.ts`); é `res.data.origem`, não
+ * `res.data.lead` (o clone novo, que vive no funil de DESTINO e não pertence a
+ * este cache), que volta para o quadro atual — mesmo padrão de
+ * `gravaLeadNoQuadro` que `useLoseLead` já usa, então o card sai visualmente
+ * para a etapa de perda deste funil, com o motivo na linha do tempo.
+ */
+export function useMoveLeadToPipeline(pipelineId: string) {
+  const qc = useQueryClient();
+  const queryKey = ["board", pipelineId] as const;
+  return useMutation({
+    mutationFn: async ({ leadId, targetPipelineId, targetStageId }: MoveToPipelineArgs) => {
+      marcarEcoLocal(leadId);
+      return apiClient.post<{ data: { lead: Lead; origem: Lead } }>(
+        `/api/v1/leads/${leadId}/clone`,
+        {
+          pipeline_id: targetPipelineId,
+          // Sem escolha, o corpo é EXATAMENTE o de antes: quem decide a etapa
+          // continua sendo o servidor.
+          ...(targetStageId ? { stage_id: targetStageId } : {}),
+        },
+      );
+    },
+    onSuccess: (res, { leadId }) => {
+      gravaLeadNoQuadro(qc, queryKey, leadId, res?.data?.origem);
     },
     onError: showApiError,
     onSettled: (_data, _err, { leadId }) => {

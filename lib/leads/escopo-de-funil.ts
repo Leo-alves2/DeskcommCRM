@@ -69,6 +69,17 @@ export const ALVO_DE_FUNIL: Record<string, AlvoDeFunil> = {
   // Não muda o card, mas pendura uma decisão humana nele — encher o funil da
   // Andrea de sugestões da IA é ocupar a atenção de quem cuida dele.
   crm_propose_reactivation: "funil_vem_do_lead",
+  // Propõe campos do CARD de um negócio lido num documento (#3316): recebe
+  // `leadId` e grava `lead_field_proposals` — a fila pendura no mesmo card, no
+  // MESMO funil. Sem classificação a vacuidade recusava a ferramenta: "não
+  // decidido" não é "não se aplica".
+  crm_propose_lead_fields_from_document: "funil_vem_do_lead",
+  // Recebe lead_id direto — mesmo alvo de crm_update_lead: o funil sai do
+  // negócio informado, uma consulta.
+  crm_draft_proposal: "funil_vem_do_lead",
+  // Cria o negócio NOVO no MESMO funil da origem (issue #1538): o `stage_id`
+  // opcional é recusado se for de outro funil, então o alvo é o funil do lead.
+  crm_retomar_lead: "funil_vem_do_lead",
 
   // ---- tocam o lead de lado: RETORNO INTERNO, não estado do card ----
   // ⚠️ Este comentário dizia "agenda", e a palavra passou a apontar para a coisa
@@ -122,6 +133,13 @@ export const ALVO_DE_FUNIL: Record<string, AlvoDeFunil> = {
 
   // ---- não têm funil, e isso é declarado ----
   crm_send_whatsapp_message: "sem_funil",
+  // #4129 — envia o DOCUMENTO da empresa na conversa; não lê nem move negócio,
+  // e o material é catálogo da organização. Mesmo alvo da irmã acima.
+  crm_send_material: "sem_funil",
+  // O Status do WhatsApp não toca negócio nenhum: é publicação de mídia no
+  // canal. Declarado (e não ausente) porque a régua de vacuidade recusa a
+  // ferramenta nova que ninguém classificou.
+  crm_publish_whatsapp_status: "sem_funil",
   // Abre conversa nova (contato pode nem ter negócio ainda) e manda a primeira
   // mensagem — não recebe `lead_id` nem `pipeline_id`. Como as de configuração
   // logo abaixo, a barreira dela é OUTRA: `requiresRole: manager` +
@@ -132,9 +150,19 @@ export const ALVO_DE_FUNIL: Record<string, AlvoDeFunil> = {
   crm_add_case_note: "sem_funil",
   crm_close_human_case: "sem_funil",
   crm_assign_conversation: "sem_funil",
+  // #3881: escolhe a FILA da conversa (`sector_id`), não o negócio. Não lê nem
+  // grava `crm_leads`, então a classificação é "não se aplica" — declarada,
+  // porque ausência aqui é recusa por vacuidade (`ferramenta_nao_classificada`).
+  crm_set_conversation_sector: "sem_funil",
   crm_resume_ai_attendance: "sem_funil",
   crm_save_org_memory: "sem_funil",
   crm_propose_contact_field: "sem_funil",
+  // Rascunho sugerido por integração (#1611): opera por `conversation_id`,
+  // nunca `lead_id`, e não mexe em estado de funil nenhum. A barreira é OUTRA,
+  // e é dela que a segurança depende: o RBAC da rota (agent+), o escopo
+  // `mcp:write` do token e o fato de a porta NÃO enviar nada — o texto fica
+  // guardado e quem atende é que clica em enviar.
+  crm_create_conversation_draft: "sem_funil",
   // Configuração da casa. Já não é alcançável pelo agente (papel acima do dele);
   // entram aqui para o teste de vacuidade não as acusar, e com a nota de que a
   // barreira delas é OUTRA.

@@ -9,12 +9,16 @@ import * as React from "react";
 
 import { Button } from "@/components/ui/button";
 import { useHorariosLivres } from "@/hooks/agenda/useHorariosLivres";
+import { useHorariosLivresPorPessoa } from "@/hooks/agenda/useHorariosLivresPorPessoa";
 import { useRemarcarAgendamento } from "@/hooks/agenda/useRemarcarAgendamento";
+import type { FechamentoDaGrade } from "@/lib/agenda/fechamentos-na-grade";
 import type { MotivoDaGradeTravada } from "@/lib/agenda/grade-interativa";
 import { cn } from "@/lib/utils";
 
-import { GradeDaAgenda } from "./GradeDaAgenda";
+import { GradeDaAgenda, JANELA_DA_GRADE } from "./GradeDaAgenda";
+import { QuadroPorProfissional } from "./QuadroPorProfissional";
 import type { Agendamento, Pessoa, VisaoDaAgenda } from "./tipos";
+import { dataDeParede, diaLocalISO } from "@/lib/agenda/fuso";
 
 /**
  * A AGENDA QUE RESPONDE — o que liga a grade à disponibilidade real e ao
@@ -43,22 +47,33 @@ export function AgendaInterativa({
   visao,
   ancora,
   agora,
+  fuso,
   pessoas,
   agendamentos,
+  fechamentos,
   recorte,
   tipos,
   tipo,
   onEscolherTipo,
   onMarcarEm,
   onAbrirAgendamento,
+  donoId,
+  onMarcarComProfissional,
   className,
 }: {
   visao: VisaoDaAgenda;
   ancora: Date;
   /** INJETADO, como na grade: relógio lido aqui dentro daria dois relógios ao teste. */
   agora: Date;
+  /**
+   * O fuso RESOLVIDO da organização — a régua de hora de parede da grade.
+   * Sem ele a grade desenha no relógio do navegador (issue #1362).
+   */
+  fuso: string;
   pessoas: Pessoa[];
   agendamentos: Agendamento[];
+  /** As faixas de "Dias fora da rotina", repassadas à grade como vieram. */
+  fechamentos?: FechamentoDaGrade[];
   /** A MESMA janela que a grade desenha — vem de quem já a calcula, sem recontá-la. */
   recorte: { de: string; ate: string };
   /**
@@ -98,22 +113,67 @@ export function AgendaInterativa({
    */
   onMarcarEm?: (instante: string) => void;
   onAbrirAgendamento?: (id: string) => void;
+  /**
+   * O PROFISSIONAL ISOLADO no filtro da agenda (#4186) — `null` = "todos".
+   *
+   * A grade pergunta a disponibilidade de UM profissional (a rota recebe
+   * `event_type_id` e, opcionalmente, `owner_user_id`). Sem esta prop, isolar a
+   * Ana mostrava os blocos dela e pintava como "livre" a jornada do DONO DO TIPO
+   * — clicar ali abria o painel da Ana num horário que a Ana não atende, e o
+   * motor recusava a escrita. O filtro tem de governar os dois lados: o que se
+   * vê e o que se oferece clicar.
+   */
+  donoId?: string | null;
+  /**
+   * O clique num bloco livre do QUADRO (#4186): ali a linha diz QUEM atende, e
+   * o painel precisa abrir com essa pessoa — não com o dono do tipo nem com o
+   * isolado do filtro. `undefined` = quadro de leitura, pela mesma regra de
+   * `onMarcarEm`.
+   */
+  onMarcarComProfissional?: (instante: string, pessoaId: string) => void;
   className?: string;
 }) {
   const localeDaData = useLocaleDeData();
   const t = useT();
+  const ehQuadro = visao === "quadro";
+  // As linhas do quadro obedecem ao MESMO filtro de pessoas que a grade: com a
+  // Ana isolada, o quadro tem uma linha só — a dela.
+  const linhasDoQuadro = React.useMemo(
+    () => (donoId ? pessoas.filter((p) => p.id === donoId) : pessoas),
+    [pessoas, donoId],
+  );
+  const livresDoQuadro = useHorariosLivresPorPessoa(
+    ehQuadro && tipo ? tipo.id : null,
+    ehQuadro ? linhasDoQuadro.map((p) => p.id) : [],
+    recorte,
+  );
   const { data: horarios, isError: horariosFalharam } = useHorariosLivres(
-    tipo ? { event_type_id: tipo.id, de: recorte.de, ate: recorte.ate } : null,
+    // No quadro cada linha pergunta por si (acima); a consulta única da grade
+    // seria um pedido a mais, de uma pessoa só, que ninguém desenharia.
+    tipo && !ehQuadro
+      ? {
+          event_type_id: tipo.id,
+          owner_user_id: donoId ?? undefined,
+          de: recorte.de,
+          ate: recorte.ate,
+        }
+      : null,
   );
 
   const horariosPorDia = React.useMemo(() => {
     const mapa: Record<string, Array<{ instante: string; rotulo: string }>> = {};
     for (const s of horarios?.slots ?? []) {
       const d = new Date(s.inicio);
-      (mapa[format(d, "yyyy-MM-dd")] ??= []).push({ instante: s.inicio, rotulo: format(d, "HH:mm") });
+      // Chave E rótulo no fuso da ORGANIZAÇÃO: a grade da ao lado já desenha
+      // nessa régua, e um `format(d, ...)` aqui anuncia "às 09:00" para um
+      // bloco que pinta às 10:00 (issue #1362).
+      (mapa[diaLocalISO(d, fuso)] ??= []).push({
+        instante: s.inicio,
+        rotulo: format(dataDeParede(d, fuso), "HH:mm"),
+      });
     }
     return mapa;
-  }, [horarios]);
+  }, [horarios, fuso]);
 
   /**
    * Por que a grade está travada — a MESMA ordem do painel de marcação, e de
@@ -126,7 +186,18 @@ export function AgendaInterativa({
    * aviso nenhum. Por isso o erro é testado ANTES, e a ausência de resposta não
    * vira afirmação.
    */
-  const motivo: MotivoDaGradeTravada | null = horariosFalharam
+  const estadosDoQuadro = Object.values(livresDoQuadro);
+  const motivo: MotivoDaGradeTravada | null = ehQuadro
+    ? !tipo || estadosDoQuadro.length === 0
+      ? null
+      : estadosDoQuadro.some((e) => e.falhou)
+        ? "erro"
+        : estadosDoQuadro.every((e) => e.slots !== null && !e.publicou)
+          ? "sem-jornada"
+          : estadosDoQuadro.every((e) => e.slots !== null && e.slots.length === 0)
+            ? "sem-vaga"
+            : null
+    : horariosFalharam
     ? "erro"
     : horarios && !horarios.publicou_horarios
       ? "sem-jornada"
@@ -201,11 +272,13 @@ export function AgendaInterativa({
       setRecusa(
         t("A remarcação não foi aceita — o compromisso voltou para {data}.").replace(
           "{data}",
-          format(new Date(antes.comeca), t("EEEE, d 'de' MMMM 'às' HH:mm"), { locale: localeDaData }),
+          format(dataDeParede(new Date(antes.comeca), fuso), t("EEEE, d 'de' MMMM 'às' HH:mm"), {
+            locale: localeDaData,
+          }),
         ),
       );
     });
-  }, [agendamentos, pendente, remarcar, localeDaData, t]);
+  }, [agendamentos, pendente, remarcar, localeDaData, t, fuso]);
 
   const nomeDoPendente = pendente
     ? (agendamentos.find((a) => a.id === pendente.id)?.titulo ?? t("o compromisso"))
@@ -253,7 +326,7 @@ export function AgendaInterativa({
           data-testid="motivo-da-grade"
           data-motivo={motivo}
           role="status"
-          className="rounded-sm border border-border bg-surface-sunken px-3 py-2 text-xs leading-4 text-text-muted"
+          className="rounded-sm border border-border bg-surface-elevated px-3 py-2 text-xs leading-4 text-text-muted"
         >
           {motivo === "sem-jornada" ? (
             <>
@@ -289,7 +362,9 @@ export function AgendaInterativa({
           <p className="text-xs leading-4 text-text">
             {t("Remarcar")} <span className="font-semibold">{nomeDoPendente}</span> {t("para")}{" "}
             <span className="font-semibold">
-              {format(new Date(pendente.instante), t("EEEE, d 'de' MMMM 'às' HH:mm"), { locale: localeDaData })}
+              {format(dataDeParede(new Date(pendente.instante), fuso), t("EEEE, d 'de' MMMM 'às' HH:mm"), {
+                locale: localeDaData,
+              })}
             </span>
             {t("? Quem foi atendido recebe o aviso da mudança.")}
           </p>
@@ -321,12 +396,36 @@ export function AgendaInterativa({
         </div>
       )}
 
+      {ehQuadro ? (
+        <QuadroPorProfissional
+          dia={ancora}
+          fuso={fuso}
+          pessoas={linhasDoQuadro}
+          agendamentos={agendamentos}
+          fechamentos={fechamentos}
+          livres={Object.fromEntries(
+            linhasDoQuadro.map((p) => [
+              p.id,
+              livresDoQuadro[p.id]?.slots?.map((s) => ({
+                instante: s.inicio,
+                rotulo: format(dataDeParede(new Date(s.inicio), fuso), "HH:mm"),
+              })),
+            ]),
+          )}
+          primeiraHora={JANELA_DA_GRADE.primeira}
+          ultimaHora={JANELA_DA_GRADE.ultima}
+          onMarcarEm={tipo ? onMarcarComProfissional : undefined}
+          onAbrirAgendamento={onAbrirAgendamento}
+        />
+      ) : (
       <GradeDaAgenda
         visao={visao}
         ancora={ancora}
         agora={agora}
+        fuso={fuso}
         pessoas={pessoas}
         agendamentos={desenhados}
+        fechamentos={fechamentos}
         onAbrirAgendamento={onAbrirAgendamento}
         className="min-h-0 flex-1"
         interacao={
@@ -352,6 +451,7 @@ export function AgendaInterativa({
             : undefined
         }
       />
+      )}
     </div>
   );
 }

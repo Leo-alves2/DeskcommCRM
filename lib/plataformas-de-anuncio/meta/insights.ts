@@ -45,22 +45,14 @@
  * `limite_de_chamadas` e ganha mensagem própria na tela, em vez de virar "erro
  * ao carregar" — o operador precisa saber que a espera resolve.
  */
-import { VERSAO_PADRAO_DA_GRAPH } from "@/lib/graph-version";
 import { logger } from "@/lib/logger";
+
+import { baseDaGraphDeAnuncio } from "./graph-base";
 import type {
   ContaDeAnuncio,
   FalhaDeLeitura,
   ResultadoDeLeitura,
 } from "../types";
-
-/**
- * A MESMA versão que `conversions.ts` fixa, e pelo mesmo motivo: a instalação
- * não deve conviver com duas versões da mesma plataforma. Subir de versão é uma
- * mudança deliberada, feita num arquivo só (`lib/graph-version.ts`), depois de
- * reconferir os campos — a lição do achado 2 acima é justamente que campo
- * válido some entre versões.
- */
-const VERSAO_DA_API = VERSAO_PADRAO_DA_GRAPH;
 
 const TEMPO_LIMITE_MS = 20_000;
 
@@ -121,7 +113,24 @@ const CAMPOS_DE_INSIGHTS = [...CAMPOS_DE_INSIGHTS_BASE, ...CAMPOS_DO_CONNECT_RAT
  */
 const CAMPOS_DE_INSIGHTS_SEM_CONNECT_RATE = CAMPOS_DE_INSIGHTS_BASE.join(",");
 
-const CAMPOS_DE_CAMPANHA = ["id", "name", "status", "effective_status", "objective"].join(",");
+/**
+ * Os campos do cadastro da campanha.
+ *
+ * `created_time`/`start_time` entraram com a #3911: sem eles a tabela não tem
+ * por onde ordenar e a ordem acaba sendo a da plataforma (das mais antigas para
+ * as mais novas), que é o defeito que a issue descreve. Os dois são campos
+ * históricos do nó `campaigns` — não são campo novo como os do Connect rate,
+ * logo não pedem a repetição de `lerInsights`.
+ */
+const CAMPOS_DE_CAMPANHA = [
+  "id",
+  "name",
+  "status",
+  "effective_status",
+  "objective",
+  "created_time",
+  "start_time",
+].join(",");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // O formato do fio — tipos do que a plataforma devolve
@@ -169,6 +178,17 @@ export interface CampanhaCrua {
   status?: string;
   effective_status?: string;
   objective?: string;
+  /**
+   * Quando a campanha foi criada, no formato da plataforma
+   * (`2026-08-14T09:31:10+0000`). É a chave da ordenação padrão da tabela
+   * (#3911) — a campanha mais recente primeiro.
+   */
+  created_time?: string;
+  /**
+   * Quando a campanha começou a veicular. Desempata `created_time` igual, que
+   * acontece de verdade quando duas campanhas nascem do mesmo rascunho.
+   */
+  start_time?: string;
 }
 
 interface RespostaPaginada<T> {
@@ -314,8 +334,14 @@ async function buscarPaginado<T>(
   return { ok: true, dados: acumulado };
 }
 
-function montarUrl(caminho: string, parametros: Record<string, string>): string {
-  const url = new URL(`https://graph.facebook.com/${VERSAO_DA_API}/${caminho}`);
+/**
+ * Exportada, e não copiada: o endereço da Graph e a versão da API existem UMA
+ * vez neste eixo. Uma segunda cópia em `hierarquia-do-anuncio.ts` sobreviveria à
+ * próxima subida de versão sem ninguém notar — e a lição do achado 2 no
+ * cabeçalho é justamente que campo válido some entre versões.
+ */
+export function montarUrl(caminho: string, parametros: Record<string, string>): string {
+  const url = new URL(`${baseDaGraphDeAnuncio()}/${caminho}`);
   for (const [chave, valor] of Object.entries(parametros)) {
     url.searchParams.set(chave, valor);
   }

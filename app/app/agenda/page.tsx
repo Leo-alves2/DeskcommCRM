@@ -1,15 +1,20 @@
+import { tituloDaAgenda } from "@/lib/agenda/apresentacao";
 import { redirect } from "next/navigation";
+import { headers } from "next/headers";
 
 import {
   enderecoDeRetorno,
   faltaParaConectarOGoogle,
   googleEstaConfigurado,
+  origemLocalDosCabecalhos,
 } from "@/lib/agenda/google/config";
+import { funisComCamposDeData } from "@/lib/agenda/datas-dos-negocios";
+import { lerEscolhaDaCamada } from "@/lib/agenda/preferencia-da-camada";
 import { donosDaAgenda } from "@/lib/agenda/donos-da-agenda";
 import { lerOcupacaoExterna } from "@/lib/agenda/ocupacao-externa";
 import { PROVEDOR_GOOGLE } from "@/lib/agenda/tipos";
-import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
-import { semanaSemente } from "@/lib/agenda/semana-semente";
+import { requireAuth, resolveActiveOrg, metadadosDaSessao } from "@/lib/auth/server";
+import { diaDeHojeNoFuso, semanaSemente } from "@/lib/agenda/semana-semente";
 import { fusoUtilizavel } from "@/lib/tempo/fusos";
 import { nomeDoContato, type ContatoNomeavel } from "@/lib/contacts/rotulo-do-contato";
 import { logger } from "@/lib/logger";
@@ -54,6 +59,8 @@ export default async function AgendaPage() {
   const user = await requireAuth();
   const activeOrg = await resolveActiveOrg(user);
   if (!activeOrg) redirect("/app");
+  const cabecalhos = await headers();
+  const origemLocal = origemLocalDosCabecalhos(cabecalhos);
 
   // `user.timezone` e não `user_metadata.timezone`: o AuthUser deste projeto
   // não expõe o metadata cru — ele extrai o que toda tela precisa no primeiro
@@ -89,25 +96,31 @@ export default async function AgendaPage() {
   const supabase = await createClient();
 
   /**
-   * A semana da âncora, que é o que a grade abre por padrão — calculada no fuso
-   * de QUEM OLHA, não no do processo.
+   * O RELÓGIO É DA ORGANIZAÇÃO — decisão do dono do produto (2026-09-20, #1350):
    *
-   * `startOfWeek(new Date())` usava o fuso do contêiner (UTC), e o cliente
-   * recalcula no fuso do navegador: das 21h de sábado à meia-noite em São Paulo,
-   * UTC já virou domingo e o servidor mandava a SEMANA SEGUINTE. Quem abre a
-   * Agenda nessa janela vê a semana errada até a página hidratar, e a consulta
-   * que este arquivo adianta logo abaixo foi feita para o período errado — o
-   * dado chega e é descartado.
+   *   "Seria da organização com divisão entre pessoas. Uma organização pode por
+   *    exemplo ter 5 pessoas/agendas diferentes."
    *
-   * A ordem do fuso é a mesma que a tela já usa para apresentar: a escolha da
-   * PESSOA primeiro (`user.timezone`, de Configurações › Perfil), a da
-   * ORGANIZAÇÃO depois (`organizations.timezone`, do wizard e de Configurações
-   * › Empresa), e o padrão do produto por último. Nenhum escritor valida essas
-   * colunas, então `fusoUtilizavel` recusa o que o `Intl` não aceita em vez de
-   * deixar a página estourar por causa de um acento no campo de configuração.
+   * A divisão entre pessoas é sobre DE QUEM é cada compromisso dentro da semana
+   * comum — filtro e trilha de cor, que a grade já tem. Não é sobre fuso: cinco
+   * atendentes da mesma clínica olham a MESMA semana.
+   *
+   * ⚠️ `user.timezone` NÃO entra nesta conta, e a versão anterior deste arquivo
+   * o punha como degrau de cima. A escada com duas fontes trazia de volta a
+   * divergência que a issue existe para fechar: o servidor não conhece o fuso do
+   * NAVEGADOR de quem abre, então qualquer degrau que dependa da pessoa volta a
+   * ser palpite no primeiro render. `organizations.timezone` é `NOT NULL` com
+   * default (`baseline.sql`), então aqui sempre há resposta — e é a MESMA que o
+   * cliente vai usar, porque ela viaja como prop logo abaixo.
+   *
+   * `fusoUtilizavel` fica porque a coluna não é validada por escritor nenhum
+   * (`z.string().max(64)` sem `refine`, sem CHECK) e `Intl` LANÇA com fuso
+   * inválido: um acento no campo de configuração viraria tela branca.
    */
-  const fusoDaSemana = fusoUtilizavel(fusoDeApresentacao, activeOrg.timezone);
-  const { de: inicio, ate: fim } = semanaSemente(new Date(), fusoDaSemana);
+  const fusoDaAgenda = fusoUtilizavel(activeOrg.timezone);
+  const { de: inicio, ate: fim } = semanaSemente(new Date(), fusoDaAgenda);
+  /** A data de hoje NO FUSO DA ORGANIZAÇÃO, para o cliente ancorar na mesma. */
+  const hojeNaOrganizacao = diaDeHojeNoFuso(new Date(), fusoDaAgenda);
 
   // `.eq("organization_id", activeOrg.orgId)` em TODA consulta desta página, e
   // não só a RLS. A `fn_user_org_ids()` que as policies usam devolve TODAS as
@@ -116,11 +129,11 @@ export default async function AgendaPage() {
   // organizações via seis tipos onde há três — e clicar no da outra org dava
   // "Tipo de agendamento não encontrado", porque a rota que marca ESCAPA a org
   // certa e não achava o tipo que esta tela ofereceu.
-  const [{ data: tipos }, { data: linhas }] = await Promise.all([
+  const [{ data: tipos }, { data: linhas }, { data: apresentacao }, { data: funis }] = await Promise.all([
     supabase
       .from("calendar_event_types")
       .select(
-        "id, name, duration_minutes, location_kind, location_details, is_active, default_owner_user_id",
+        "id, name, duration_minutes, location_kind, location_details, is_active, default_owner_user_id, service_enabled, booking_mode",
       )
       .eq("organization_id", activeOrg.orgId)
       .eq("is_active", true)
@@ -128,12 +141,31 @@ export default async function AgendaPage() {
     supabase
       .from("calendar_appointments")
       .select(
-        "id, revision, title, starts_at, ends_at, status, owner_user_id, contact_id, event_type_id, location_kind, contacts(name, display_name)",
+        "id, revision, title, starts_at, ends_at, status, owner_user_id, team_guest_user_ids, contact_id, event_type_id, location_kind, contacts(name, display_name)",
       )
       .eq("organization_id", activeOrg.orgId)
       .gte("starts_at", inicio.toISOString())
       .lt("starts_at", fim.toISOString())
       .order("starts_at"),
+    supabase.from("organizations").select("settings").eq("id", activeOrg.orgId).maybeSingle(),
+    // ─── OS FUNIS, para a camada "Datas dos negócios" (#3221) ────────────────
+    //
+    // Só `id`, `name` e `settings`: os campos de data moram em `settings.fields`,
+    // e é deles que sai a lista de campos que a camada oferece. Descoberta no
+    // servidor, e não no cliente, porque a MESMA régua já existe
+    // (`camposDeDataDoNegocio`) e porque a RLS de `crm_pipelines` é quem decide
+    // quais funis esta pessoa enxerga — funil que ela não vê não aparece na
+    // escolha da camada.
+    //
+    // Arquivado fica de fora pela mesma razão do seletor de troca rápida do
+    // quadro: funil arquivado não recebe negócio novo, e oferecê-lo seria um
+    // destino que não existe.
+    supabase
+      .from("crm_pipelines")
+      .select("id, name, settings")
+      .eq("organization_id", activeOrg.orgId)
+      .eq("is_archived", false)
+      .order("position"),
   ]);
 
   /**
@@ -236,18 +268,69 @@ export default async function AgendaPage() {
   const googleConfigurado = await googleEstaConfigurado();
   const faltaNoGoogle = googleConfigurado ? [] : await faltaParaConectarOGoogle();
 
+  // ─── A CAMADA "DATAS DOS NEGÓCIOS" (#3221, escolha guardada pela #4436) ────
+  //
+  // Os funis que declaram campo de data: a matéria-prima da camada, resolvida
+  // aqui com a mesma régua que o Calendário do funil usa.
+  const funisComDatas = funisComCamposDeData(
+    (
+      (funis ?? []) as Array<{
+        id: string;
+        name: string;
+        settings: Record<string, unknown> | null;
+      }>
+    ).map((f) => ({ id: f.id, nome: f.name, settings: f.settings })),
+  );
+
+  /**
+   * A ESCOLHA DA PESSOA (#4436), lida do `raw_user_meta_data` — e só quando há
+   * camada a oferecer. Instalação que não usa campo de data não paga nem a
+   * leitura: `funisComDatas` vazio e a camada nem aparece.
+   *
+   * `lerEscolhaDaCamada` sanea contra ESTA lista: funil arquivado não está nela
+   * (a consulta acima filtra `is_archived = false`) e campo que sumiu não está
+   * nos `campos`. O que sobra é só escolha que ainda existe — o resto volta ao
+   * padrão sem erro na tela.
+   */
+  const escolhaDaCamada =
+    funisComDatas.length > 0
+      ? lerEscolhaDaCamada(await metadadosDaSessao(), funisComDatas)
+      : undefined;
+
   return (
     <AgendaClient
+      tituloDaAgenda={tituloDaAgenda(apresentacao?.settings)}
+      // O fuso RESOLVIDO da organização: a régua da grade inteira. `page.tsx`
+      // é a única que tem `activeOrg.timezone`, e até aqui ele parava em
+      // `hojeNaOrganizacao` — a âncora era da organização, mas os blocos e a
+      // linha do "agora" continuavam no relógio do navegador (issue #1362).
+      fusoDaAgenda={fusoDaAgenda}
       fusoDeApresentacao={fusoDeApresentacao}
+      // A MESMA data que a semente acima usou. Sem isto, o cliente recalcula com
+      // `new Date()` do navegador e a divergência volta INTEIRA — não só na
+      // janela de sábado, mas para todo usuário fora do fuso da organização.
+      hojeNaOrganizacao={hojeNaOrganizacao}
       // QUEM ESTÁ LOGADO, do servidor. É o único jeito de a tela saber se o
       // dono da agenda é ela mesma: sem isto, sem lista da equipe (papel abaixo
       // de `agent`, que é o piso de `/api/v1/agenda/pessoas`) a agenda inventava
       // uma pessoa chamada "Você" para a jornada de OUTRA pessoa — ver o painel
       // em `_client.tsx`.
       usuarioId={user.id}
+      // A CAMADA "Datas dos negócios" (#3221) — os funis que declaram campo de
+      // data do negócio, e só eles.
+      //
+      // Lista vazia é o estado de quem não usa campo de data: a camada não
+      // aparece, e a Agenda fica exatamente como era. Quem escolhe o que ver é
+      // a pessoa (a camada nasce desligada), e a escolha de QUAIS campos são
+      // datas não é feita aqui — ela vem do funil, pela mesma função que o
+      // Calendário do funil usa (`camposDeDataDoNegocio`).
+      funisComDatas={funisComDatas}
+      // A escolha que a pessoa deixou (#4436): a camada volta ligada no funil
+      // e no campo dela, em qualquer aparelho. Saneada logo acima.
+      escolhaDaCamada={escolhaDaCamada}
       googleConfigurado={googleConfigurado}
       contaConectada={conexoes?.map((c) => c.account_email).join(", ") || null}
-      enderecoDeRetorno={enderecoDeRetorno()}
+      enderecoDeRetorno={enderecoDeRetorno(origemLocal ?? undefined)}
       faltaNoGoogle={faltaNoGoogle}
       // SÓ para quem administra a INSTALAÇÃO. A tela do app OAuth vive em
       // `/admin` e faz `notFound()` para o resto — oferecer o link a quem não
@@ -267,6 +350,8 @@ export default async function AgendaPage() {
         // lista de pessoas como responsável e marcava na agenda dele — enquanto
         // os horários oferecidos vinham da jornada de outra pessoa.
         donoId: t.default_owner_user_id ?? null,
+        servicoColetivo: t.service_enabled && t.booking_mode !== "individual",
+        servico: t.service_enabled,
         // O LOCAL DE VERDADE. O `select` acima já trazia `location_kind` e
         // `location_details`, e o mapeamento os descartava — então o painel caía
         // no default de parâmetro e toda clínica de toda instalação lia
@@ -280,6 +365,8 @@ export default async function AgendaPage() {
           revision: a.revision,
           titulo: a.title ?? "Agendamento",
           responsavelId: a.owner_user_id ?? "",
+          convidadosDaEquipe: a.team_guest_user_ids,
+          tipoId: a.event_type_id,
           comeca: a.starts_at,
           termina: a.ends_at,
           origem: "ui" as const,

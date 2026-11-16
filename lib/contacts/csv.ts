@@ -159,13 +159,19 @@ const DELIMITERS = [",", ";", "\t"] as const;
  * ponto-e-vírgula e tabulação — Excel pt-BR exporta com ";".
  */
 export function parseCsv(raw: string): string[][] {
+  return parseCsvComLinhas(raw).map((linha) => linha.cells);
+}
+
+/** Numera os registros antes de descartar os vazios. Uma quebra entre aspas pertence à célula. */
+export function parseCsvComLinhas(raw: string): { cells: string[]; rowNumber: number }[] {
   const text = raw.replace(/^\uFEFF/, "");
   const delimiter = detectDelimiter(text);
 
-  const rows: string[][] = [];
+  const rows: { cells: string[]; rowNumber: number }[] = [];
   let row: string[] = [];
   let field = "";
   let inQuotes = false;
+  let rowNumber = 1;
   let i = 0;
 
   while (i < text.length) {
@@ -199,7 +205,8 @@ export function parseCsv(raw: string): string[][] {
     if (ch === "\r" || ch === "\n") {
       if (ch === "\r" && text[i + 1] === "\n") i += 1;
       row.push(field);
-      rows.push(row);
+      rows.push({ cells: row, rowNumber });
+      rowNumber += 1;
       row = [];
       field = "";
       i += 1;
@@ -211,9 +218,9 @@ export function parseCsv(raw: string): string[][] {
   // Última linha sem quebra final ainda precisa entrar.
   if (field !== "" || row.length > 0) {
     row.push(field);
-    rows.push(row);
+    rows.push({ cells: row, rowNumber });
   }
-  return rows.filter((r) => !(r.length === 1 && r[0] === ""));
+  return rows.filter(({ cells }) => !(cells.length === 1 && cells[0] === ""));
 }
 
 function detectDelimiter(text: string): string {
@@ -241,17 +248,27 @@ function detectDelimiter(text: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Aceita apelidos pt-BR/en porque a planilha é feita por humano: quem importa
- * tem "Telefone" no Excel, não "phone_number". Acento/caixa/separador são
- * normalizados ("Data de Nascimento" → data_de_nascimento).
+ * Aceita apelidos pt-BR/en/es porque a planilha é feita por humano: quem importa
+ * tem "Telefone" (ou "Teléfono") no Excel, não "phone_number". Acento/caixa/
+ * separador são normalizados ("Data de Nascimento" → data_de_nascimento,
+ * "Fecha de nacimiento" → fecha_de_nacimiento). Os de espanhol cumprem o que a
+ * tela de importação promete a quem a usa nesse idioma.
  */
 const HEADER_ALIASES: Record<string, readonly string[]> = {
-  name: ["name", "nome", "cliente"],
-  display_name: ["display_name", "apelido", "nome_de_exibicao"],
-  email: ["email", "e_mail"],
-  phone_number: ["phone_number", "telefone", "whatsapp", "celular", "fone"],
+  name: ["name", "nome", "cliente", "nombre"],
+  display_name: ["display_name", "apelido", "nome_de_exibicao", "apodo", "nombre_para_mostrar"],
+  email: ["email", "e_mail", "correo", "correo_electronico"],
+  phone_number: ["phone_number", "telefone", "whatsapp", "celular", "fone", "telefono", "movil"],
   cpf: ["cpf"],
-  birthdate: ["birthdate", "nascimento", "data_de_nascimento", "aniversario"],
+  birthdate: [
+    "birthdate",
+    "nascimento",
+    "data_de_nascimento",
+    "aniversario",
+    "nacimiento",
+    "fecha_de_nacimiento",
+    "cumpleanos",
+  ],
   tags: ["tags", "etiquetas", "grupos"],
 };
 
@@ -376,9 +393,13 @@ export function mapLinha(
   indices: Record<string, number>,
   t?: (text: string) => string,
   documento?: DocumentoDoTitular,
+  /** O exemplo de telefone do PAÍS da organização; sem ele, a mensagem de erro
+   *  ensinava o DDI brasileiro a quem importa uma planilha de Lisboa. */
+  telefoneExemplo?: string,
 ): { contato: LinhaNormalizada; motivo: string | null } {
   const _t = t || ((x) => x);
   const doc = documento ?? perfilDoPais(null).documento;
+  const exemploDeTelefone = telefoneExemplo ?? perfilDoPais(null).telefoneExemplo;
   const get = (campo: string): string => {
     const idx = indices[campo];
     return idx === undefined ? "" : (cells[idx] ?? "").trim();
@@ -408,7 +429,8 @@ export function mapLinha(
         motivo:
           _t("telefone inválido: ") +
           `"${phoneRaw}"` +
-          _t(" (use DDI+DDD+número, ex.: +5511999998888)"),
+          _t(" (use o número com o código do país, por exemplo ") +
+          `${exemploDeTelefone})`,
       };
     }
     contato.phone_number = phone;

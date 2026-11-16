@@ -17,10 +17,26 @@ import { type NextRequest } from "next/server";
 import { z } from "zod";
 
 import { listaAgendamentos, type AgendamentoListado } from "@/lib/agenda/consulta";
+import { MAXIMO_DE_CONVIDADOS_DA_EQUIPE } from "@/lib/agenda/convidados-da-equipe";
+import { DURACAO_MAXIMA_MIN, DURACAO_MINIMA_MIN } from "@/lib/agenda/duracao-escolhida";
 import { donosDaAgenda } from "@/lib/agenda/donos-da-agenda";
 import { lerOcupacaoExterna } from "@/lib/agenda/ocupacao-externa";
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
+import type { Actor } from "@/lib/api/handlers/types";
+import { ApiError } from "@/lib/api/types";
+import { chaveDaRequisicao } from "@/lib/api/idempotency";
 import { fail, ok } from "@/lib/api/wrappers";
+import { requireRole } from "@/lib/auth/require-role";
+import { traduzir } from "@/lib/i18n/dicionario";
+import { IDIOMA_PADRAO } from "@/lib/i18n/idiomas";
 import { logger } from "@/lib/logger";
+import { createClient } from "@/lib/supabase/server";
+
+import {
+  alterarAgendamentoHandler,
+  cancelarAgendamentoHandler,
+  marcarAgendamentoHandler,
+} from "./_handler";
 
 /**
  * O que ESTA ROTA devolve — o contrato da lista mais a ORIGEM.
@@ -31,18 +47,9 @@ import { logger } from "@/lib/logger";
  * e não se clica.
  */
 type AgendamentoDaResposta = AgendamentoListado & { origem?: "google_sync" };
-import { ApiError } from "@/lib/api/types";
-import { requireRole } from "@/lib/auth/require-role";
-import { createClient } from "@/lib/supabase/server";
-import { traduzir } from "@/lib/i18n/dicionario";
-
-import {
-  alterarAgendamentoHandler,
-  cancelarAgendamentoHandler,
-  marcarAgendamentoHandler,
-} from "./_handler";
 
 const listarSchema = z.object({
+  collective_only: z.enum(["true", "false"]).transform((value) => value === "true").optional(),
   contact_id: z.string().uuid().optional(),
   lead_id: z.string().uuid().optional(),
   owner_user_id: z.string().uuid().optional(),
@@ -76,6 +83,47 @@ const emailDoConvidado = z.preprocess(
   z.union([z.literal(""), z.string().email().max(320)]),
 );
 
+/**
+ * O TÍTULO — e o VAZIO é recusa, não "volte ao nome do tipo".
+ *
+ * A criação já aceita texto livre desde o #3766 (`marcarSchema.title`, `max 200`,
+ * e campo AUSENTE significa "usa o nome do tipo" — `_handler.ts`,
+ * `title ?? tipo.name`). Na EDIÇÃO a régua é outra: o compromisso já tem título
+ * gravado (`title` é `not null` no banco), e "vazio" aqui não teria um molde óbvio para onde
+ * voltar — o nome do tipo pode ter mudado desde a marcação, e o compromisso
+ * pode ter sido criado já com outro nome. Recusar com mensagem clara é o que
+ * a #3776 pede; adivinhar seria trocar o título de alguém por outro que ele
+ * nunca escolheu.
+ *
+ * O `preprocess` apara ANTES de decidir, como no e-mail do convidado: quem
+ * apagou o campo e deixou um espaço para trás quis limpar, não errar de
+ * formato — e `"   "` tem de cair na recusa do vazio, não passar como um título
+ * de três espaços.
+ */
+const tituloDoCompromisso = z.preprocess(
+  (v) => (typeof v === "string" ? v.trim() : v),
+  z
+    .string()
+    .min(1, { message: "O título do compromisso não pode ficar vazio." })
+    .max(200, { message: "O título do compromisso cabe em até 200 caracteres." }),
+);
+
+/**
+ * OS CONVIDADOS DA EQUIPE (#4006) — ids de membros desta organização.
+ *
+ * `[]` limpa a lista; AUSENTE não mexe. A distinção é a mesma do e-mail do
+ * convidado, e existe pelo mesmo motivo: um PATCH de remarcação não pode
+ * desconvidar a equipe só porque a tela não mandou o campo.
+ *
+ * O teto vem de `lib/agenda/convidados-da-equipe.ts` — a MESMA constante que o
+ * handler aplica. Aqui ele é 422 de schema (o id malformado nem chega ao banco);
+ * lá é a conferência de organização, que o schema não tem como fazer.
+ */
+const convidadosDaEquipe = z
+  .array(z.string().uuid())
+  .max(MAXIMO_DE_CONVIDADOS_DA_EQUIPE)
+  .optional();
+
 const marcarSchema = z.object({
   event_type_id: z.string().uuid(),
   starts_at: z.string().datetime({ offset: true }),
@@ -87,6 +135,27 @@ const marcarSchema = z.object({
   description: z.string().max(2000).optional(),
   location_details: z.string().max(300).optional(),
   guest_email: emailDoConvidado.optional(),
+  team_guest_user_ids: convidadosDaEquipe,
+  /**
+   * A duração DESTE atendimento, em minutos (issue #3709) — ausente, a do tipo.
+   *
+   * A faixa é a dos moldes (`lib/agenda/duracao-escolhida.ts`), e recusar aqui
+   * é o que impede um valor absurdo de virar um bloco de três minutos ou de
+   * 25 horas. O handler confere de novo porque a ferramenta MCP o chama sem
+   * passar por este schema.
+   */
+  duration_minutes: z.number().int().min(DURACAO_MINIMA_MIN).max(DURACAO_MAXIMA_MIN).optional(),
+  participant_name: z.string().trim().min(1).max(120).optional(),
+  participants: z.array(z.string().trim().min(1).max(120)).min(1).max(20).optional(),
+  /**
+   * O LUGAR reservado e quantas pessoas vêm (issue #4029). Ausentes, o serviço
+   * sem lugar continua reservando como antes; num serviço COM lugares a recusa
+   * vem nomeada (`space_required`), nunca uma vaga escolhida em silêncio.
+   * `party_size` presente conta em pessoas na capacidade do serviço também.
+   */
+  space_id: z.string().uuid().optional(),
+  party_size: z.number().int().min(1).max(100000).optional(),
+  expected_service_revision: z.number().int().positive().optional(),
 });
 
 const alterarSchema = z
@@ -95,7 +164,7 @@ const alterarSchema = z
     revision: z.number().int().positive().optional(),
     outcome_message_id: z.string().uuid().optional(),
     confirmation_next_at: z.string().datetime({ offset: true }).optional(),
-    /** Remarcar: o novo início. A duração vem do tipo, como na criação. */
+    /** Remarcar: o novo início. O FIM conserva o comprimento do bloco que já existe (#3709). */
     starts_at: z.string().datetime({ offset: true }).optional(),
     /**
      * `rescheduled` NÃO entra aqui: remarcar se pede mandando `starts_at`, e é
@@ -104,6 +173,22 @@ const alterarSchema = z
     status: z.enum(["confirmed", "completed", "no_show"]).optional(),
     notes: z.string().max(2000).optional(),
     guest_email: emailDoConvidado.optional(),
+    team_guest_user_ids: convidadosDaEquipe,
+    /**
+     * O texto que a grade desenha no bloco (#3776). Entra no `.refine` abaixo:
+     * sem isso o campo era DESCARTADO em silêncio e o pedido voltava com
+     * "Informe pelo menos um campo para alterar" — mentindo sobre a causa, já
+     * que o cliente tinha mandado um campo.
+     */
+    title: tituloDoCompromisso.optional(),
+    /**
+     * A duração que a pessoa escolheu (#4450) — a segunda porta do campo da
+     * #3709. Sem esta linha o PATCH DESCARTAVA o número em silêncio: a tela
+     * mandaria a duração, o handler responderia "alterado", e o bloco ficaria
+     * com o comprimento de antes. A faixa é a mesma da criação, e o handler
+     * confere de novo porque a ferramenta MCP o chama sem passar por aqui.
+     */
+    duration_minutes: z.number().int().min(DURACAO_MINIMA_MIN).max(DURACAO_MAXIMA_MIN).optional(),
   })
   .refine(
     (c) =>
@@ -111,7 +196,10 @@ const alterarSchema = z
       c.starts_at !== undefined ||
       c.status !== undefined ||
       c.notes !== undefined ||
-      c.guest_email !== undefined,
+      c.guest_email !== undefined ||
+      c.team_guest_user_ids !== undefined ||
+      c.title !== undefined ||
+      c.duration_minutes !== undefined,
     {
       message: "Informe pelo menos um campo para alterar.",
     },
@@ -138,16 +226,20 @@ const cancelarSchema = z.object({
  * igual para a tela e para a IA.
  *
  * O recorte que a grade usa é `de`+`ate`, em INSTANTES. A tela é semanal e
- * mensal (seis semanas), então o filtro por `dia` não a serve — e ele tem um
- * corte em UTC que, para fuso negativo, não é o dia de quem olha: medido para
- * São Paulo, o "dia 12" pega três horas do dia 11 e perde as três últimas do 12.
- * Mandando instante, quem chama calcula os limites no fuso de APRESENTAÇÃO e
- * esta rota não precisa adivinhar em que fuso o dia foi pedido.
+ * mensal (seis semanas), então o filtro por `dia` não a serve — e ele corta no
+ * fuso da ORGANIZAÇÃO (desde a #1744; sem fuso legível, em UTC), que não é
+ * necessariamente o fuso de quem olha. Mandando instante, quem chama calcula os
+ * limites no fuso de APRESENTAÇÃO e esta rota não precisa adivinhar em que fuso
+ * o dia foi pedido.
  */
 export async function GET(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
-  // `viewer`: olhar a agenda é o menor privilégio desta feature.
+  // `viewer`: olhar a agenda é o menor privilégio desta feature. E SEGUE
+  // SÓ-SESSÃO — `requireRole` não lê Bearer, e abrir isto a token é decisão de
+  // produto, não de implementação (a própria suíte da rota trava este estado;
+  // ver o cabeçalho de `GET … continua só-sessão` em `route.test.ts`). Quem
+  // integra agenda por token continua saindo pela ferramenta MCP.
   const authz = await requireRole("viewer", { requestId, resource: "agenda" });
   if (!authz.ok) return authz.response;
   const t = (texto: string) => traduzir(texto, authz.user.idioma);
@@ -155,6 +247,7 @@ export async function GET(req: NextRequest): Promise<Response> {
 
   const url = new URL(req.url);
   const parsed = listarSchema.safeParse({
+    collective_only: url.searchParams.get("collective_only") ?? undefined,
     contact_id: url.searchParams.get("contact_id") ?? undefined,
     lead_id: url.searchParams.get("lead_id") ?? undefined,
     owner_user_id: url.searchParams.get("owner_user_id") ?? undefined,
@@ -173,6 +266,7 @@ export async function GET(req: NextRequest): Promise<Response> {
 
   const supabase = await createClient();
   const resultado = await listaAgendamentos(supabase, activeOrg.orgId, {
+    ...(parsed.data.collective_only !== undefined ? { somenteColetivas: parsed.data.collective_only } : {}),
     contactId: parsed.data.contact_id ?? null,
     leadId: parsed.data.lead_id ?? null,
     ownerUserId: parsed.data.owner_user_id ?? null,
@@ -184,13 +278,15 @@ export async function GET(req: NextRequest): Promise<Response> {
   });
 
   if (!resultado.ok) {
-    // ⚠️ DUAS DAS TRÊS RECUSAS SÃO ERRO DE QUEM CHAMA — e o `else` de antes
+    // ⚠️ QUATRO DAS CINCO RECUSAS SÃO ERRO DE QUEM CHAMA — e o `else` de antes
     // chamava todas de falha do servidor.
     //
-    // `sem_alvo` (falta recorte) e `alvo_nao_e_lead` (o `lead_id` veio com o id
-    // de um CONTATO — a confusão medida em #509) são consulta malformada: o
-    // servidor está inteiro, e 500 diz ao cliente server-to-server que a culpa é
-    // nossa. Pior: acorda o Sentry por requisição malformada, que é ruído.
+    // `sem_alvo` (falta recorte), `alvo_nao_e_lead` (o `lead_id` veio com o id
+    // de um CONTATO — a confusão medida em #509), `janela_invalida` (período
+    // invertido, incompleto ou acima do teto) e `cursor_invalido` são consulta
+    // malformada: o servidor está inteiro, e 500 diz ao cliente server-to-server
+    // que a culpa é nossa. Pior: acorda o Sentry por requisição malformada, que
+    // é ruído.
     //
     // O mapa é explícito — mesmo desenho de `CODIGO_DA_RECUSA` em `_handler.ts`
     // — porque status e código andam juntos, e a indexação pelo código faz o
@@ -198,6 +294,8 @@ export async function GET(req: NextRequest): Promise<Response> {
     const recusa = {
       sem_alvo: { status: 422, code: "agenda_listagem_sem_recorte" },
       alvo_nao_e_lead: { status: 422, code: "agenda_listagem_alvo_nao_e_lead" },
+      janela_invalida: { status: 422, code: "agenda_listagem_janela_invalida" },
+      cursor_invalido: { status: 422, code: "agenda_listagem_cursor_invalido" },
       erro_interno: { status: 500, code: "internal_error" },
     } as const;
     const { status, code } = recusa[resultado.codigo];
@@ -205,6 +303,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   }
 
   // ─── A OCUPAÇÃO DO GOOGLE ENTRA AQUI, e não em `listaAgendamentos` ────────
+  if (parsed.data.collective_only) return ok(resultado.agendamentos, { requestId });
   //
   // O defeito, medido em produção em 2026-09-01: 114 eventos vindos do Google no
   // banco, 1 deles na semana desenhada, e a tela mostrando a agenda vazia.
@@ -289,7 +388,7 @@ export async function POST(req: NextRequest): Promise<Response> {
   const supportDenied = await requireSupportWrite();
   if (supportDenied) return supportDenied;
 
-  return despachar(req, marcarSchema, marcarAgendamentoHandler, 201);
+  return despachar(req, marcarSchema, marcarAgendamentoHandler, 201, true);
 }
 
 export async function PATCH(req: NextRequest): Promise<Response> {
@@ -307,28 +406,64 @@ export async function DELETE(req: NextRequest): Promise<Response> {
 }
 
 /**
- * O caminho comum dos três verbos: papel, forma, handler, tradução.
+ * O caminho comum dos três verbos: identidade, forma, handler, tradução.
  *
  * Um só, e não três cópias, porque a diferença entre eles é o schema e a função
  * — o resto é idêntico, e três cópias divergiriam no primeiro ajuste, que é
  * exatamente o defeito que a extração do handler veio consertar.
+ *
+ * Aceita sessão de navegador OU token de servidor (`dsk_…` com `mcp:write`),
+ * mesma dualidade de `/api/v1/messages` e `/api/v1/leads/[id]`: a integração de
+ * monitoramento processual marca a audiência/perícia por aqui, sem navegador.
+ * `_handler.ts` já esperava `Actor` completo (é a mesma função que a tool MCP
+ * chama) — só a rota restringia o tipo a `{type:"user"}` antes desta troca.
+ *
+ * ⚠️ Token de servidor sem o scope `actor:ai_agent` vira `actor.type ===
+ * "api_token"` (`lib/mcp/auth.ts`, `deriveActor`), e `podeMarcarForaDaGrade`
+ * só libera `"user"` para marcar fora da grade de disponibilidade. Uma
+ * audiência que o juiz marcou não respeita a agenda do advogado — se a
+ * integração precisar disso, é decisão de produto a abrir (ampliar
+ * `podeMarcarForaDaGrade`), não algo para contornar aqui.
  */
 async function despachar<T>(
   req: NextRequest,
   schema: z.ZodType<T>,
   handler: (
     supabase: Awaited<ReturnType<typeof createClient>>,
-    ctx: { organization_id: string; actor: { type: "user"; id: string }; requestId: string },
+    ctx: { organization_id: string; actor: Actor; requestId: string; idempotencyKey?: string },
     input: T,
   ) => Promise<Record<string, unknown>>,
   status: 200 | 201,
+  aceitaIdempotencyKey = false,
 ): Promise<Response> {
   const requestId = randomUUID();
 
-  const authz = await requireRole("agent", { requestId, resource: "agenda" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "agenda",
+    role: "agent",
+    scope: "mcp:write",
+    // O MESMO papel das tools MCP de escrita na agenda (`lib/mcp/tools/
+    // agendamento.ts`, `requiresRole: "ai_operator"`), que chamam estes mesmos
+    // handlers. Token criado pela tela nasce `agent`: sem esta linha, o `dsk_`
+    // que leva 403 ao cancelar pela tool cancelaria por aqui. E ator que não é
+    // pessoa escapa de "atendente só mexe na própria agenda"
+    // (`aOpcaoPodeRecortar`) — um token `agent` mexeria na agenda de todos.
+    tokenRole: "ai_operator",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
-  const { org: activeOrg, user } = authz;
+  // `idioma` só vem no ramo de sessão (`resolveAuthDual`); o ramo de token não
+  // tem preferência de idioma de pessoa nenhuma — degrada para o padrão.
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? IDIOMA_PADRAO);
+  const { supabase, organizationId, actor } = authz;
+
+  const idempotencyKey = aceitaIdempotencyKey ? chaveDaRequisicao(req) : null;
+  if (idempotencyKey !== null && !z.string().uuid().safeParse(idempotencyKey).success) {
+    return fail("validation_failed", "Idempotency-Key deve ser UUID", 400, { requestId });
+  }
+
+  const tetoEstourado = await tetoDeEscritaDoToken(authz, "agenda", requestId);
+  if (tetoEstourado) return tetoEstourado;
 
   const parsed = schema.safeParse(await req.json().catch(() => null));
   if (!parsed.success) {
@@ -338,17 +473,16 @@ async function despachar<T>(
     });
   }
 
-  const supabase = await createClient();
   try {
     const resultado = await handler(
       supabase,
       {
-        // A organização vem do COOKIE VALIDADO, nunca do corpo. Pela tool, ela
-        // vem do contexto do agente — e é por isso que o handler a recebe como
-        // parâmetro em vez de resolvê-la sozinho.
-        organization_id: activeOrg.orgId,
-        actor: { type: "user", id: user.id },
+        // A organização vem do COOKIE VALIDADO ou da LINHA DO TOKEN, nunca do
+        // corpo. Pela tool MCP nativa, ela vem do contexto do agente.
+        organization_id: organizationId,
+        actor,
         requestId,
+        ...(idempotencyKey !== null ? { idempotencyKey } : {}),
       },
       parsed.data,
     );

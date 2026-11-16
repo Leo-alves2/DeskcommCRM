@@ -39,7 +39,8 @@ import { configuracaoDoGoogle } from "@/lib/agenda/google/config";
 import { classificarErroDoGoogle, estadoDaConexaoApos } from "@/lib/agenda/google/erros";
 import { fundirTokens, precisaRenovar, type TokenDoGoogle } from "@/lib/agenda/google/oauth";
 import { renovarToken } from "@/lib/agenda/google/token";
-import { env } from "@/lib/env";
+import { autorizaCron } from "@/lib/auth/cron-auth";
+import { comIdDaRequisicao } from "@/lib/api/wrappers";
 
 export const dynamic = "force-dynamic";
 
@@ -132,7 +133,12 @@ export async function renovarAgendasDoGoogle(
 
     const leitura = await renovarToken(app, refresh, { agora: opcoes.agora });
     if (!leitura.ok) {
-      const classificacao = classificarErroDoGoogle({ error: leitura.detalhe }, "token");
+      // O status vai junto (#2393): sem ele, uma recusa 400 do Google virava
+      // "sem resposta" na tela e `transitorio` na classificação.
+      const classificacao = classificarErroDoGoogle(
+        { error: leitura.detalhe, status: leitura.status },
+        "token",
+      );
       const novoEstado = estadoDaConexaoApos(classificacao.desfecho);
       if (novoEstado && novoEstado !== "healthy") {
         await marcarConexao(admin, linha, novoEstado, classificacao.mensagem);
@@ -203,19 +209,12 @@ async function marcarConexao(
     .eq("id", linha.id);
 }
 
-function autorizado(req: NextRequest): boolean {
-  const cabecalho = req.headers.get("authorization") ?? "";
-  const aceitos = [env.INTERNAL_CRON_SECRET, env.INTERNAL_SECRET].filter(Boolean);
-  // Fail-closed: sem segredo configurado, ninguém entra.
-  return aceitos.length > 0 && aceitos.some((s) => cabecalho === `Bearer ${s}`);
-}
-
 async function executar(req: NextRequest): Promise<Response> {
-  if (!autorizado(req)) {
-    return NextResponse.json({ error: { code: "unauthenticated", message: "cron secret inválido" } }, { status: 401 });
+  if (!autorizaCron(req)) {
+    return comIdDaRequisicao(NextResponse.json({ error: { code: "unauthenticated", message: "cron secret inválido" } }, { status: 401 }), req);
   }
   const resumo = await renovarAgendasDoGoogle(createAdminClient(), { agora: new Date() });
-  return NextResponse.json({ data: resumo });
+  return comIdDaRequisicao(NextResponse.json({ data: resumo }), req);
 }
 
 export async function GET(req: NextRequest): Promise<Response> {

@@ -14,27 +14,42 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { useLoseLead } from "@/hooks/kanban/useUpdateLead";
 import { useMotivosDePerdaDoFunil } from "@/hooks/kanban/useMotivosDePerdaDoFunil";
-import { CANONICAL_LOST_REASONS } from "@/lib/schemas/leads";
-import type { CanonicalLostReason } from "@/lib/schemas/leads";
-import { OUTRO, motivoDePerdaAceito, opcoesDeMotivoDePerda } from "@/lib/leads/motivos-de-perda-do-funil";
-
-const REASON_LABELS: Record<(typeof CANONICAL_LOST_REASONS)[number], string> = {
-  requested_by_customer: "Cliente solicitou cancelamento",
-  price: "Preço",
-  no_response: "Sem resposta do cliente",
-  product_unavailable: "Produto indisponível",
-  cancelled_by_store: "Cancelado pela loja",
-  cancelled_by_customer: "Cancelado pelo cliente",
-  payment_failed: "Falha no pagamento",
-  other: "Outro motivo",
-  moved_to_another_pipeline: "Levado para outro funil",
-};
+import { rotuloDoMotivoDePerda } from "@/lib/schemas/leads";
+import {
+  OUTRO,
+  motivoDePerdaAceito,
+  opcoesDeMotivoDePerda,
+} from "@/lib/leads/motivos-de-perda-do-funil";
 
 interface LoseLeadDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  leadId: string;
   pipelineId: string;
+  /**
+   * Modo CARD: perde UM negócio pela rota individual (`/leads/{id}/lose`).
+   * Ausente no modo lote.
+   */
+  leadId?: string;
+  /**
+   * Modo LOTE (#2484 F2): recebe o motivo escolhido e quem chamou decide a
+   * escrita — a `leads/bulk` que já sabe decidir o motivo da perda (#917). O
+   * diálogo é o MESMO do card: uma segunda janela de motivo seria a mesma
+   * pergunta com duas respostas possíveis, e o funil passaria a ter duas listas.
+   */
+  onConfirm?: (lostReason: string) => void | Promise<void>;
+  /**
+   * Modo LOTE: quem chamou informa se a escrita em lote está em voo. Este
+   * diálogo não conhece a mutação de lote (`useBulkAction`) — então não pode
+   * perguntar `isPending` a ela; sem este sinal o botão "Confirmar" ficaria
+   * clicável durante a escrita e um segundo clique dobraria o lote.
+   */
+  submitting?: boolean;
+  /** Depois de a perda gravar — para quem mora fora do quadro (ex.: painel da conversa) recarregar o que mostra. */
+  onPerdido?: () => void;
+  /** Motivos do funil quando o quadro não está em cache (painel da conversa); sem isto, lê do cache do quadro. */
+  motivos?: string[];
+  /** Identifica o negócio na confirmação individual; omitido no lote. */
+  leadLabel?: string;
 }
 
 const MAX_LEN = 500;
@@ -44,15 +59,24 @@ export function LoseLeadDialog({
   onOpenChange,
   leadId,
   pipelineId,
+  onConfirm,
+  submitting = false,
+  onPerdido,
+  motivos,
+  leadLabel,
 }: LoseLeadDialogProps) {
   const t = useT();
   const [reasonCode, setReasonCode] = useState<string>("");
   const [otherText, setOtherText] = useState("");
   const mutation = useLoseLead(pipelineId);
+  // O diálogo vale para os DOIS modos: a escrita individual (card) ou a do
+  // chamador (lote). "em voo" é a mutação individual OU o sinal externo.
+  const emVoo = mutation.isPending || submitting;
 
   // O funil deste card manda na lista: o que ele tem cadastrado substitui o
   // padrão do produto — ver lib/leads/motivos-de-perda-do-funil.ts.
-  const cadastrados = useMotivosDePerdaDoFunil(pipelineId);
+  const doQuadro = useMotivosDePerdaDoFunil(pipelineId);
+  const cadastrados = motivos ?? doQuadro;
   const opcoes = useMemo(() => opcoesDeMotivoDePerda(cadastrados), [cadastrados]);
   const funilConfigurado = cadastrados.length > 0;
 
@@ -86,9 +110,7 @@ export function LoseLeadDialog({
   // texto do "Detalhe" NUNCA era aceito pelo servidor, e a pessoa só descobria
   // depois de já ter clicado "Confirmar".
   const outroRecusado =
-    reasonCode === OUTRO &&
-    textoOutro.length > 0 &&
-    !motivoDePerdaAceito(textoOutro, cadastrados);
+    reasonCode === OUTRO && textoOutro.length > 0 && !motivoDePerdaAceito(textoOutro, cadastrados);
 
   const finalReason = reasonCode === OUTRO ? textoOutro || OUTRO : reasonCode;
   const disabled =
@@ -96,15 +118,26 @@ export function LoseLeadDialog({
     finalReason.length === 0 ||
     finalReason.length > MAX_LEN ||
     outroRecusado ||
-    mutation.isPending;
+    emVoo;
 
   const handleSubmit = async () => {
     if (disabled) return;
     try {
-      await mutation.mutateAsync({ leadId, lostReason: finalReason });
+      // Modo LOTE (#2484 F2): o motivo vai para quem chamou, que escreve pela
+      // `leads/bulk`. Modo CARD: a rota individual. Sem `leadId` NEM `onConfirm`
+      // não há escrita nenhuma a fazer — o `disabled` já cobre o caso de uso,
+      // e este guarda evita um clique pendurado em arranjo inválido.
+      if (onConfirm) {
+        await onConfirm(finalReason);
+      } else if (leadId) {
+        await mutation.mutateAsync({ leadId, lostReason: finalReason });
+      } else {
+        return;
+      }
       setReasonCode("");
       setOtherText("");
       onOpenChange(false);
+      onPerdido?.();
     } catch {
       // error already toasted
     }
@@ -116,6 +149,7 @@ export function LoseLeadDialog({
         <DialogHeader>
           <DialogTitle>{t("Marcar como perdido")}</DialogTitle>
           <DialogDescription>
+            {leadLabel && <span className="mb-1 block font-medium">{leadLabel}</span>}
             {t("Informe o motivo. Essa informação ajuda a melhorar o funil.")}
           </DialogDescription>
         </DialogHeader>
@@ -135,15 +169,13 @@ export function LoseLeadDialog({
                   checked={reasonCode === opcao.valor}
                   onChange={(e) => setReasonCode(e.target.value)}
                 />
-                <span>{opcao.doFunil ? opcao.valor : t(REASON_LABELS[opcao.valor as CanonicalLostReason] ?? opcao.valor)}</span>
+                <span>{opcao.doFunil ? opcao.valor : t(rotuloDoMotivoDePerda(opcao.valor))}</span>
               </label>
             ))}
           </div>
           {reasonCode === OUTRO && (
             <div className="grid gap-1.5">
-              <Label htmlFor="lost-reason-other">
-                {t("Detalhe (opcional)")}
-              </Label>
+              <Label htmlFor="lost-reason-other">{t("Detalhe (opcional)")}</Label>
               <Textarea
                 id="lost-reason-other"
                 value={otherText}
@@ -181,7 +213,9 @@ export function LoseLeadDialog({
               */}
               {(funilConfigurado || outroRecusado) && (
                 <p className="text-xs text-muted-foreground">
-                  {t("Para usar um motivo que não está aqui, cadastre em Configurações › Funis.")}
+                  {t(
+                    "Para usar um motivo que não está aqui, cadastre em CRM › Ver tudo em CRM › Etapas do funil.",
+                  )}
                 </p>
               )}
             </div>
@@ -189,15 +223,11 @@ export function LoseLeadDialog({
         </div>
 
         <DialogFooter>
-          <Button
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={mutation.isPending}
-          >
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={emVoo}>
             {t("Cancelar")}
           </Button>
           <Button onClick={handleSubmit} disabled={disabled}>
-            {mutation.isPending ? t("Salvando...") : t("Confirmar")}
+            {emVoo ? t("Salvando...") : t("Confirmar")}
           </Button>
         </DialogFooter>
       </DialogContent>

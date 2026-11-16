@@ -1,14 +1,15 @@
 /**
  * QA VISUAL DO LOTE 12 — #936, LEVAR O NEGÓCIO PARA OUTRO FUNIL.
  *
- * ⚠️ NÃO HÁ BOTÃO. O próprio fragmento do lote declara: "por enquanto pela API
- * (`POST /api/v1/leads/[id]/clone`); o botão no quadro vem na fatia seguinte".
- * O que se prova pela TELA, então, são os EFEITOS — e é o que esta spec faz:
- * o card no funil de destino, os campos personalizados nele, e as duas linhas
- * do tempo. A chamada sai do próprio navegador logado, com o cookie de sessão,
- * que é o mesmo caminho que o botão vai usar.
+ * O primeiro caso nasceu quando NÃO havia botão (o fragmento do lote dizia "por
+ * enquanto pela API"): ele prova os EFEITOS — o card no funil de destino, os
+ * campos personalizados nele, e as duas linhas do tempo — com a chamada saindo
+ * do navegador logado. O botão chegou depois ("Levar para outro funil", no menu
+ * do card, #1578), e o último caso desta spec é ele: clicado por quem tem o
+ * MENOR papel que pode usá-lo (`agent`), porque a lista de destinos é uma
+ * exceção deliberada à leitura de funis, que na gestão é `manager`+.
  */
-import { test } from "@playwright/test";
+import { test } from "./helpers/test";
 
 import {
   admin,
@@ -114,7 +115,7 @@ test.describe("Lote 12 — #936 a troca de funil", () => {
 
     // Estado de partida, pela tela.
     await page.goto(`/app/pipelines/${origemId}`);
-    await expect(page.getByRole("group", { name: `Lead: Negócio ${S}` })).toBeVisible({
+    await expect(page.getByRole("group", { name: `Negócio: Negócio ${S}` })).toBeVisible({
       timeout: 60_000,
     });
     await captura(page, "936-01-origem-antes");
@@ -130,7 +131,7 @@ test.describe("Lote 12 — #936 a troca de funil", () => {
 
     // ── O DESTINO, pela tela ──────────────────────────────────────────────
     await page.goto(`/app/pipelines/${destinoId}`);
-    const cardNovo = page.getByRole("group", { name: `Lead: Negócio ${S}` });
+    const cardNovo = page.getByRole("group", { name: `Negócio: Negócio ${S}` });
     await expect(cardNovo).toBeVisible({ timeout: 60_000 });
     await captura(page, "936-02-destino-com-o-card");
 
@@ -141,11 +142,15 @@ test.describe("Lote 12 — #936 a troca de funil", () => {
     await cardNovo.click();
     const dossie = page.getByRole("dialog");
     await expect(dossie).toBeVisible({ timeout: 30_000 });
-    await page.waitForLoadState("networkidle").catch(() => {});
+    // A linha do tempo carrega DEPOIS do diálogo abrir ("Carregando a linha do
+    // tempo…"), e `networkidle` não espera por ela: uma leitura única de
+    // `innerText` corria contra a busca. Espera-se o ESTADO, e só então lê.
+    await expect(dossie, "o clone precisa dizer de onde veio").toContainText("Veio", {
+      timeout: 30_000,
+    });
+    await expect(dossie).toContainText(`Troca Origem ${S}`);
     const textoClone = await dossie.innerText();
     registra(`#936 · dossiê do CLONE = ${JSON.stringify(textoClone.slice(0, 900))}`);
-    expect(textoClone, "o clone precisa dizer de onde veio").toContain("Veio");
-    expect(textoClone).toContain(`Troca Origem ${S}`);
 
     // Os campos personalizados aparecem na tela do DESTINO — e eles moram em
     // <input>, cujo valor `innerText` não enxerga. A régua é `inputValue()`.
@@ -183,11 +188,14 @@ test.describe("Lote 12 — #936 a troca de funil", () => {
     expect(JSON.stringify(origem)).toContain(destinoId);
 
     // Abrir o card da origem pela tela, para ver a linha do tempo com os olhos.
-    const cardVelho = page.getByRole("group", { name: `Lead: Negócio ${S}` }).first();
+    const cardVelho = page.getByRole("group", { name: `Negócio: Negócio ${S}` }).first();
     if (await cardVelho.count()) {
       await cardVelho.click();
-      await page.waitForLoadState("networkidle").catch(() => {});
-      const textoOrigem = await page.getByRole("dialog").innerText().catch(() => "");
+      // Mesma corrida do clone: espera a linha do tempo da origem contar para
+      // onde o negócio foi, e só então lê o texto para o registro.
+      const dossieOrigem = page.getByRole("dialog");
+      await expect(dossieOrigem).toContainText(`Troca Destino ${S}`, { timeout: 30_000 });
+      const textoOrigem = await dossieOrigem.innerText();
       registra(`#936 · dossiê da ORIGEM = ${JSON.stringify(textoOrigem.slice(0, 900))}`);
     }
     await captura(page, "936-04-linha-do-tempo-da-origem");
@@ -222,5 +230,68 @@ test.describe("Lote 12 — #936 a troca de funil", () => {
     expect(r.status()).toBe(422);
     expect(corpo).toMatch(/pipeline_immutable_use_clone|stage_pipeline_mismatch/);
     await admin.from("crm_leads").delete().eq("id", outro);
+  });
+
+  test("pelo BOTÃO: o atendente leva o negócio pelo menu do card, e ele sai deste funil", async ({
+    page,
+  }) => {
+    const titulo = `Pelo botão ${S}`;
+    const pelaTela = await insere("crm_leads", {
+      organization_id: c.org_id,
+      pipeline_id: origemId,
+      stage_id: etapaOrigem,
+      title: titulo,
+      position_in_stage: 3000,
+      source: "manual",
+    });
+
+    await login(page, c.users.agent!.email, c.password);
+    await page.goto(`/app/pipelines/${origemId}`);
+    const card = page.getByRole("group", { name: `Negócio: ${titulo}` });
+    await expect(card).toBeVisible({ timeout: 60_000 });
+
+    await card.getByRole("button", { name: "Ações do negócio" }).click();
+    await page.getByRole("menuitem", { name: "Levar para outro funil" }).click();
+    const janela = page.getByRole("dialog", { name: "Levar para outro funil" });
+    await expect(janela).toBeVisible();
+
+    // A lista é a da organização SEM o funil atual — o atendente não é
+    // oferecido a levar o negócio para onde ele já está.
+    await janela.getByRole("combobox", { name: "Funil de destino" }).click();
+    await expect(page.getByRole("option", { name: `Troca Origem ${S}` })).toHaveCount(0);
+    await page.getByRole("option", { name: `Troca Destino ${S}` }).click();
+    await captura(page, "1578-01-destino-escolhido");
+    await janela.getByRole("button", { name: "Confirmar" }).click();
+    await expect(janela).toBeHidden({ timeout: 30_000 });
+
+    // Efeito no BANCO: a origem fechou como perdida e o clone nasceu no destino.
+    await expect
+      .poll(
+        async () => {
+          const { data } = await admin
+            .from("crm_leads")
+            .select("status")
+            .eq("id", pelaTela)
+            .single();
+          return (data as { status: string } | null)?.status;
+        },
+        { timeout: 30_000 },
+      )
+      .toBe("lost");
+    const { data: clones } = await admin
+      .from("crm_leads")
+      .select("id, stage_id")
+      .eq("pipeline_id", destinoId)
+      .eq("title", titulo);
+    registra(`#1578 · clone pelo botão = ${JSON.stringify(clones)}`);
+    expect(clones, "exatamente UM negócio novo no destino").toHaveLength(1);
+    expect((clones as { stage_id: string }[])[0]!.stage_id).toBe(etapaDestino);
+
+    // Efeito na TELA do destino: o card está lá.
+    await page.goto(`/app/pipelines/${destinoId}`);
+    await expect(page.getByRole("group", { name: `Negócio: ${titulo}` })).toBeVisible({
+      timeout: 60_000,
+    });
+    await captura(page, "1578-02-card-no-destino");
   });
 });

@@ -8,8 +8,12 @@ import { showApiError } from "@/components/feedback/ApiErrorToast";
 import { useT } from "@/hooks/i18n/useT";
 import { Button } from "@/components/ui/button";
 import { apiClient } from "@/lib/api/client";
+import { queryDaTela } from "@/lib/catalogo/busca-da-tela";
+import { MAXIMO_DE_FOTOS } from "@/lib/catalogo/fotos";
 import { formatCents } from "@/lib/money";
 import { precoParaCentavos, type Produto } from "@/lib/schemas/produtos";
+
+import { EdicaoDoProduto } from "./_edicao";
 
 interface Textos {
   titulo: string;
@@ -22,6 +26,8 @@ interface ResumoDaImportacao {
   total_linhas: number;
   criados: number;
   atualizados: number;
+  /** Quantos produtos tiveram a descrição escrita pela planilha. */
+  descricoes?: number;
   erros: Array<{ linha: number; motivo: string }>;
   colunas_ignoradas: string[];
 }
@@ -31,10 +37,12 @@ interface Rascunho {
   nome: string;
   marca: string;
   categoria: string;
+  capacidade: string;
   preco: string;
   custo: string;
   quantidade: string;
   controla_estoque: boolean;
+  descricao: string;
 }
 
 const VAZIO: Rascunho = {
@@ -42,10 +50,12 @@ const VAZIO: Rascunho = {
   nome: "",
   marca: "",
   categoria: "",
+  capacidade: "",
   preco: "",
   custo: "",
   quantidade: "0",
   controla_estoque: true,
+  descricao: "",
 };
 
 function doRascunho(
@@ -62,39 +72,225 @@ function doRascunho(
     nome: r.nome.trim(),
     ...(r.marca.trim() ? { marca: r.marca.trim() } : {}),
     ...(r.categoria.trim() ? { categoria: r.categoria.trim() } : {}),
+    ...(r.capacidade.trim() ? { capacidade: r.capacidade.trim() } : {}),
     preco_cents,
     custo_cents,
     controla_estoque: r.controla_estoque,
     quantidade: Number(r.quantidade) || 0,
+    ...(r.descricao.trim() ? { descricao: r.descricao.trim() } : {}),
   };
+}
+
+/**
+ * As fotos de UM produto: pôr, tirar e trocar a ordem. A primeira é a capa, e é
+ * na ordem daqui que o atendente de IA as manda ao cliente.
+ *
+ * Toda mudança vai ao servidor e volta pelo `router.refresh()`: as URLs são
+ * assinadas pela página, e a lista que vale é a do banco.
+ */
+function FotosDoProduto({ produto, urls }: { produto: Produto; urls: Record<string, string> }) {
+  const t = useT();
+  const router = useRouter();
+  const [ocupado, setOcupado] = React.useState(false);
+  const entradaRef = React.useRef<HTMLInputElement>(null);
+  const fotos = produto.fotos ?? [];
+
+  async function subir(arquivo: File) {
+    setOcupado(true);
+    try {
+      const form = new FormData();
+      form.append("file", arquivo);
+      const res = await fetch(`/api/v1/products/${produto.id}/fotos`, { method: "POST", body: form });
+      if (!res.ok) {
+        const json = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+        toast.error(json?.error?.message ?? t("Não consegui enviar a foto."));
+        return;
+      }
+      toast.success(t("Foto adicionada"));
+      router.refresh();
+    } catch {
+      toast.error(t("Não consegui enviar a foto."));
+    } finally {
+      setOcupado(false);
+      if (entradaRef.current) entradaRef.current.value = "";
+    }
+  }
+
+  async function gravarOrdem(nova: string[], aviso: string) {
+    setOcupado(true);
+    try {
+      await apiClient.put(`/api/v1/products/${produto.id}/fotos`, { fotos: nova });
+      toast.success(aviso);
+      router.refresh();
+    } catch (e) {
+      showApiError(e);
+    } finally {
+      setOcupado(false);
+    }
+  }
+
+  function mover(i: number, delta: -1 | 1) {
+    const nova = [...fotos];
+    [nova[i], nova[i + delta]] = [nova[i + delta]!, nova[i]!];
+    void gravarOrdem(nova, t("Ordem das fotos salva"));
+  }
+
+  return (
+    <div className="border-t bg-muted/30 p-3" data-testid={`fotos-${produto.codigo}`}>
+      <p className="mb-2 text-xs text-muted-foreground">
+        {t("A primeira foto é a capa. O atendente de IA manda as fotos nesta ordem quando apresenta o produto.")}
+      </p>
+      <ul className="flex flex-wrap gap-3">
+        {fotos.map((caminho, i) => (
+          <li key={caminho} className="w-28" data-testid="foto-do-produto">
+            {urls[caminho] ? (
+              // URL assinada e curta, de outro host: `next/image` exigiria allowlist no build.
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={urls[caminho]}
+                alt={`${produto.nome} — ${t("foto")} ${i + 1}`}
+                className="h-28 w-28 rounded-md border object-cover"
+              />
+            ) : (
+              <div className="flex h-28 w-28 items-center justify-center rounded-md border text-xs text-muted-foreground">
+                {t("Sem prévia")}
+              </div>
+            )}
+            <div className="mt-1 flex justify-between">
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={ocupado || i === 0}
+                onClick={() => mover(i, -1)}
+                aria-label={t("Mover a foto para a esquerda")}
+              >
+                ←
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={ocupado}
+                onClick={() => void gravarOrdem(fotos.filter((c) => c !== caminho), t("Foto removida"))}
+                aria-label={t("Remover a foto")}
+                data-testid="remover-foto"
+              >
+                ✕
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={ocupado || i === fotos.length - 1}
+                onClick={() => mover(i, 1)}
+                aria-label={t("Mover a foto para a direita")}
+              >
+                →
+              </Button>
+            </div>
+          </li>
+        ))}
+      </ul>
+      <input
+        ref={entradaRef}
+        type="file"
+        accept="image/jpeg,image/png"
+        className="hidden"
+        data-testid="arquivo-foto"
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void subir(f);
+        }}
+      />
+      <div className="mt-3 flex items-center gap-3">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={ocupado || fotos.length >= MAXIMO_DE_FOTOS}
+          onClick={() => entradaRef.current?.click()}
+          data-testid="adicionar-foto"
+        >
+          {t(ocupado ? "Salvando…" : "Adicionar foto")}
+        </Button>
+        <span className="text-xs text-muted-foreground">
+          {t("JPG ou PNG, até 5 MB. No máximo 5 fotos.")}
+        </span>
+      </div>
+    </div>
+  );
 }
 
 export function ProdutosClient({
   inicial,
+  total,
+  pagina,
+  porPagina,
+  buscaInicial,
+  urlsDasFotos,
   podeEditar,
+  capacidadeLigada = false,
+  apresentacaoLigada = false,
+  fonteDoFeed = null,
   textos,
 }: {
+  /** A página atual, já filtrada no servidor (ver `lib/catalogo/busca-da-tela.ts`). */
   inicial: Produto[];
+  /** Quantos produtos casam com a busca no catálogo INTEIRO, não só nesta página. */
+  total: number;
+  pagina: number;
+  porPagina: number;
+  buscaInicial: string;
+  urlsDasFotos: Record<string, string>;
   podeEditar: boolean;
+  /** A chave da empresa (`capacidade_do_produto`). Desligada, o campo não aparece. */
+  capacidadeLigada?: boolean;
+  apresentacaoLigada?: boolean;
+  /** A seção do módulo `catalogo_por_feed`; `null` com o módulo desligado. */
+  fonteDoFeed?: React.ReactNode;
   textos: Textos;
 }) {
   const t = useT();
   const router = useRouter();
-  const [busca, setBusca] = React.useState("");
+  const [busca, setBusca] = React.useState(buscaInicial);
+  const [carregando, iniciarNavegacao] = React.useTransition();
+
+  // A URL pode mudar sem passar pela caixa: Voltar/Avançar do navegador, ou um
+  // link. A página não remonta quando só as searchParams mudam, então a caixa
+  // precisa acompanhar — senão o debounce abaixo via a caixa diferente da URL e
+  // mandava de volta para a busca antiga. Quando a URL muda POR CAUSA da caixa
+  // (o termo já é o mesmo, sem os espaços das pontas), nada a fazer: reescrever
+  // a caixa tiraria o espaço que a pessoa acabou de digitar.
+  const [buscaDaUrl, setBuscaDaUrl] = React.useState(buscaInicial);
+  if (buscaInicial !== buscaDaUrl) {
+    setBuscaDaUrl(buscaInicial);
+    if (busca.trim() !== buscaInicial) setBusca(buscaInicial);
+  }
   const [criando, setCriando] = React.useState(false);
   const [rascunho, setRascunho] = React.useState<Rascunho>(VAZIO);
   const [salvando, setSalvando] = React.useState(false);
   const [importando, setImportando] = React.useState(false);
   const [resumo, setResumo] = React.useState<ResumoDaImportacao | null>(null);
   const arquivoRef = React.useRef<HTMLInputElement>(null);
+  const [fotosAbertas, setFotosAbertas] = React.useState<string | null>(null);
+  const [editando, setEditando] = React.useState<string | null>(null);
 
-  const filtrados = React.useMemo(() => {
-    const q = busca.trim().toLowerCase();
-    if (q === "") return inicial;
-    return inicial.filter((p) =>
-      [p.nome, p.codigo, p.marca ?? "", p.categoria ?? ""].join(" ").toLowerCase().includes(q),
-    );
-  }, [inicial, busca]);
+  // A busca vai à URL — e a URL, ao servidor, que procura no catálogo INTEIRO.
+  // Antes ela filtrava no navegador só os 500 que a página tinha trazido.
+  const irPara = React.useCallback(
+    (termo: string, novaPagina: number) => {
+      const destino = queryDaTela(termo, novaPagina) || "?";
+      iniciarNavegacao(() => router.replace(destino, { scroll: false }));
+    },
+    [router],
+  );
+
+  React.useEffect(() => {
+    if (busca.trim() === buscaInicial) return;
+    // Espera a pessoa parar de digitar: cada consulta conta o catálogo inteiro.
+    const timer = window.setTimeout(() => irPara(busca, 1), 350);
+    return () => window.clearTimeout(timer);
+  }, [busca, buscaInicial, irPara]);
+
+  const primeiro = total === 0 ? 0 : (pagina - 1) * porPagina + 1;
+  const ultimo = Math.min(pagina * porPagina, total);
 
   async function salvar() {
     const corpo = doRascunho(rascunho, t);
@@ -160,6 +356,8 @@ export function ProdutosClient({
         <p className="mt-1 text-sm text-muted-foreground">{textos.subtitulo}</p>
       </header>
 
+      {fonteDoFeed}
+
       <div className="mb-4 flex items-center gap-3">
         <input
           value={busca}
@@ -200,14 +398,21 @@ export function ProdutosClient({
         // Rota de API que devolve o arquivo com `content-disposition:
         // attachment` — é download, não navegação de página, e `<Link>` do Next
         // faria navegação de cliente para algo que não é tela.
-        <a
-          href="/api/v1/products/import"
-          download="modelo-catalogo.csv"
-          className="mb-4 inline-block text-xs text-muted-foreground underline"
-          data-testid="modelo-planilha"
-        >
-          {t("Baixar planilha modelo")}
-        </a>
+        <div className="mb-4">
+          <a
+            href="/api/v1/products/import"
+            download="modelo-catalogo.csv"
+            className="inline-block text-xs text-muted-foreground underline"
+            data-testid="modelo-planilha"
+          >
+            {t("Baixar planilha modelo")}
+          </a>
+          <p className="mt-1 break-words text-xs text-muted-foreground" data-testid="formato-da-foto">
+            {t(
+              "Na coluna foto, cole o link da imagem (JPG ou PNG, até 5 MB). Para até 5 fotos, separe os links com | — a primeira é a capa.",
+            )}
+          </p>
+        </div>
       ) : null}
 
       {resumo ? (
@@ -216,6 +421,14 @@ export function ProdutosClient({
             {resumo.criados} {t("novos")} · {resumo.atualizados} {t("atualizados")} ·{" "}
             {resumo.total_linhas} {t("linhas na planilha")}
           </p>
+          {resumo.descricoes ? (
+            <p className="mt-1 text-muted-foreground" data-testid="resumo-descricoes">
+              {t("Descrição escrita pela planilha em {quantidade} produto(s).").replace(
+                "{quantidade}",
+                String(resumo.descricoes),
+              )}
+            </p>
+          ) : null}
           {resumo.colunas_ignoradas.length > 0 ? (
             <p className="mt-2 text-muted-foreground">
               {t("Não usei estas colunas:")} {resumo.colunas_ignoradas.join(", ")}.
@@ -224,7 +437,7 @@ export function ProdutosClient({
           {resumo.erros.length > 0 ? (
             <div className="mt-3">
               <p className="font-medium">{t("Linhas que não entraram:")}</p>
-              <ul className="mt-1 space-y-0.5 text-muted-foreground">
+              <ul className="mt-1 space-y-0.5 wrap-anywhere text-muted-foreground">
                 {resumo.erros.slice(0, 20).map((e) => (
                   <li key={`${e.linha}-${e.motivo}`}>
                     {t("Linha")} {e.linha}: {e.motivo}
@@ -281,6 +494,19 @@ export function ProdutosClient({
                 className="mt-1 h-9 w-full rounded-md border px-3"
               />
             </label>
+            {capacidadeLigada ? (
+              <label className="text-sm">
+                {t("Capacidade")} <span className="text-muted-foreground">{t("(opcional)")}</span>
+                <input
+                  value={rascunho.capacidade}
+                  onChange={(e) => setRascunho({ ...rascunho, capacidade: e.target.value })}
+                  placeholder={t("Ex.: 128GB")}
+                  maxLength={60}
+                  className="mt-1 h-9 w-full rounded-md border px-3"
+                  data-testid="produto-capacidade"
+                />
+              </label>
+            ) : null}
             <label className="text-sm">
               {t("Preço de venda")}
               <input
@@ -304,6 +530,21 @@ export function ProdutosClient({
               </span>
             </label>
           </div>
+
+          <label className="mt-3 block text-sm">
+            {t("Descrição")} <span className="text-muted-foreground">{t("(opcional)")}</span>
+            <textarea
+              value={rascunho.descricao}
+              onChange={(e) => setRascunho({ ...rascunho, descricao: e.target.value })}
+              maxLength={2000}
+              rows={3}
+              className="mt-1 w-full rounded-md border px-3 py-2"
+              data-testid="produto-descricao"
+            />
+            <span className="mt-1 block text-xs text-muted-foreground">
+              {t("É o que o atendente de IA conta ao cliente: para que serve, medidas, materiais, diferenciais. Ele repete o que estiver aqui — e não inventa o que faltar.")}
+            </span>
+          </label>
 
           <label className="mt-3 flex items-center gap-2 text-sm">
             <input
@@ -339,15 +580,40 @@ export function ProdutosClient({
         </div>
       ) : null}
 
-      {filtrados.length === 0 ? (
+      {inicial.length === 0 && buscaInicial !== "" ? (
+        <div className="rounded-lg border border-dashed p-8 text-center" data-testid="produtos-busca-vazia">
+          <p className="font-medium">{t("Nenhum produto encontrado para essa busca")}</p>
+        </div>
+      ) : inicial.length === 0 ? (
         <div className="rounded-lg border border-dashed p-8 text-center" data-testid="produtos-vazio">
           <p className="font-medium">{textos.vazio}</p>
           <p className="mt-1 text-sm text-muted-foreground">{textos.vazioDica}</p>
         </div>
       ) : (
-        <ul className="divide-y rounded-lg border" data-testid="lista-produtos">
-          {filtrados.map((p) => (
-            <li key={p.id} className="flex items-center gap-4 p-3" data-testid={`produto-${p.codigo}`}>
+        <ul
+          className={`divide-y rounded-lg border ${carregando ? "opacity-60" : ""}`}
+          aria-busy={carregando}
+          data-testid="lista-produtos"
+        >
+          {inicial.map((p) => {
+            const capa = p.fotos?.[0] ? urlsDasFotos[p.fotos[0]] : undefined;
+            return (
+            <li key={p.id} data-testid={`produto-${p.codigo}`}>
+            {/*
+              A linha não cabia em 375 px: preço (shrink-0) + os três botões de
+              ação somam mais que a largura útil, e a coluna do nome — `flex-1`
+              com `min-w-0` — encolhia até 0 px, levando o nome junto. Abaixo de
+              `md` a linha passa a quebrar: nome e preço em cima, ações embaixo,
+              ancoradas à direita e com `flex-wrap` próprio se ainda faltar
+              espaço. Tudo em `max-md:` — de `md` para cima a lista é a de sempre.
+            */}
+            <div
+              className="flex items-center gap-4 p-3 max-md:flex-wrap max-md:gap-x-3 max-md:gap-y-1"
+            >
+              {capa ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={capa} alt="" className="h-10 w-10 shrink-0 rounded-md object-cover" />
+              ) : null}
               <div className="min-w-0 flex-1">
                 <p className={`truncate font-medium ${p.ativo ? "" : "text-muted-foreground line-through"}`}>
                   {p.nome}
@@ -355,28 +621,105 @@ export function ProdutosClient({
                 <p className="text-xs text-muted-foreground">
                   {p.codigo}
                   {p.marca ? ` · ${p.marca}` : ""}
+                  {capacidadeLigada && p.capacidade ? ` · ${p.capacidade}` : ""}
                   {p.controla_estoque
                     ? ` · ${p.quantidade} ${t("em estoque")}`
                     : ` · ${t("sem controle de estoque")}`}
+                  {/* Sem descrição, o atendente de IA só sabe nome e preço: a lista diz onde falta. */}
+                  {p.descricao?.trim() ? "" : ` · ${t("sem descrição")}`}
                 </p>
               </div>
               <span className="shrink-0 tabular-nums font-medium">
                 {formatCents(p.preco_cents, p.moeda)}
               </span>
               {podeEditar ? (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => void alternarAtivo(p)}
-                  data-testid={`alternar-${p.codigo}`}
+                // Grupo próprio para as ações: sozinhas elas não cabem ao lado do
+                // preço em 375 px, e como itens soltos da linha quebravam em
+                // qualquer lugar. Aqui elas descem juntas (w-full abaixo de `md`)
+                // e, se nem assim couberem, quebram entre si em vez de vazar.
+                <div
+                  className="flex items-center gap-4 max-md:w-full max-md:flex-wrap max-md:justify-end max-md:gap-x-2 max-md:gap-y-1"
                 >
-                  {t(p.ativo ? "Desativar" : "Reativar")}
-                </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setEditando((v) => (v === p.id ? null : p.id))}
+                    aria-expanded={editando === p.id}
+                    data-testid={`editar-${p.codigo}`}
+                  >
+                    {t("Editar")}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setFotosAbertas((v) => (v === p.id ? null : p.id))}
+                    aria-expanded={fotosAbertas === p.id}
+                    data-testid={`abrir-fotos-${p.codigo}`}
+                  >
+                    {t("Fotos")} ({p.fotos?.length ?? 0})
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void alternarAtivo(p)}
+                    data-testid={`alternar-${p.codigo}`}
+                  >
+                    {t(p.ativo ? "Desativar" : "Reativar")}
+                  </Button>
+                </div>
               ) : null}
+            </div>
+            {podeEditar && fotosAbertas === p.id ? (
+              <FotosDoProduto produto={p} urls={urlsDasFotos} />
+            ) : null}
+            {podeEditar && editando === p.id ? (
+              // `key` porque o painel fica na MESMA posição do DOM ao trocar de
+              // produto: sem ela o React reaproveita o estado e o formulário
+              // abriria preenchido com o produto anterior.
+              <EdicaoDoProduto
+                key={p.id}
+                produto={p}
+                capacidadeLigada={capacidadeLigada}
+                urlsDasFotos={urlsDasFotos}
+                apresentacaoLigada={apresentacaoLigada}
+                aoFechar={() => setEditando(null)}
+              />
+            ) : null}
             </li>
-          ))}
+            );
+          })}
         </ul>
       )}
+
+      {total > 0 ? (
+        <div className="mt-3 flex items-center justify-between text-sm text-muted-foreground" data-testid="paginacao-produtos">
+          <span className="tabular-nums" data-testid="contagem-produtos">
+            {primeiro}–{ultimo} {t("de")} {total}
+          </span>
+          {total > porPagina ? (
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={pagina <= 1 || carregando}
+                onClick={() => irPara(busca, pagina - 1)}
+                data-testid="pagina-anterior"
+              >
+                {t("Página anterior")}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={ultimo >= total || carregando}
+                onClick={() => irPara(busca, pagina + 1)}
+                data-testid="proxima-pagina"
+              >
+                {t("Próxima página")}
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

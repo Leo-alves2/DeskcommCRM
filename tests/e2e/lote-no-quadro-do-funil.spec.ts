@@ -31,14 +31,14 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { expect, test, type Locator, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "./helpers/test";
 import { createClient } from "@supabase/supabase-js";
 
 import { carregarEnvLocal } from "../../scripts/lib/env-de-teste";
 
 const CREDS_PATH = path.join(process.cwd(), ".e2e-creds.json");
 const EVIDENCIA =
-  process.env.E2E_EVIDENCIA ?? path.join(process.cwd(), ".superpowers/evidence/lote-no-funil");
+  process.env.E2E_EVIDENCIA ?? path.join(process.cwd(), "evidence/lote-no-funil");
 /** A prova do toque é citada na triagem do #911: mora em `evidence/`, versionada. */
 const EVIDENCIA_TOQUE =
   process.env.E2E_EVIDENCIA_TOQUE ?? path.join(process.cwd(), "evidence/excluir-card-no-toque");
@@ -71,7 +71,7 @@ async function login(page: Page, email: string, senha: string): Promise<void> {
   await page.goto("/login");
   await page.locator("#email").fill(email);
   await page.locator("#password").fill(senha);
-  await page.getByRole("button", { name: /entrar/i }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
   await page.waitForURL(/\/app/, { timeout: 60_000 });
 }
 
@@ -371,7 +371,7 @@ test.describe("Quadro do funil — agir em vários cards de uma vez", () => {
     expect(transbordo, "a página não rola na horizontal com a barra aberta").toBeLessThanOrEqual(0);
   });
 
-  test("mover vários de uma vez: os cards vão para a etapa nova, no fim e na mesma ordem", async ({
+  test("mover vários de uma vez: os cards vão para a etapa nova, no topo e na mesma ordem", async ({
     page,
   }) => {
     await login(page, creds.users.manager!.email, creds.password);
@@ -400,19 +400,22 @@ test.describe("Quadro do funil — agir em vários cards de uma vez", () => {
     await expect(page.getByText(TITULO(1), { exact: true })).toBeVisible({ timeout: 30_000 });
 
     const noBanco = await ordemNoBanco(etapaDestinoId);
-    expect(noBanco, "os três entraram no FIM do destino, na ordem em que estavam").toEqual([
-      TITULO_ANCORADO,
+    // Desde a #3461 o lote entra no TOPO do destino (encosta acima do card
+    // ancorado) e preserva entre si a ordem em que estava no quadro: quem
+    // chega por último é quem se olha primeiro.
+    expect(noBanco, "os três entraram no TOPO do destino, na ordem em que estavam").toEqual([
       TITULO(3),
       TITULO(4),
       TITULO(5),
+      TITULO_ANCORADO,
     ]);
 
     // E o quadro DESENHA a mesma ordem — banco e tela não podem divergir.
     expect(await ordemNaEtapa(page, etapaDestinoId)).toEqual([
-      TITULO_ANCORADO,
       TITULO(3),
       TITULO(4),
       TITULO(5),
+      TITULO_ANCORADO,
     ]);
     expect(await ordemNaEtapa(page, etapaOrigemId)).toEqual([
       TITULO(1),
@@ -477,6 +480,60 @@ test.describe("Quadro do funil — agir em vários cards de uma vez", () => {
   });
 
   /**
+   * O QUADRO CABE NA TELA. A página rolava com a janela: com uma etapa cheia, a
+   * barra de rolagem lateral só aparecia no pé da coluna mais comprida, e o nome
+   * da etapa sumia do alto no caminho (pedido de quem opera, 25/09/2026). Agora
+   * quem rola é o quadro, nos dois eixos, e o cabeçalho da etapa fica preso.
+   *
+   * 820×600 de propósito: com a barra lateral do app aberta, duas etapas de
+   * 20rem não cabem lado a lado, e a etapa de origem tem mais cards do que a
+   * altura do quadro — as duas rolagens existem, e o teste diz isso antes de
+   * medir (senão "a barra está à vista" passaria por não haver barra).
+   */
+  test.describe("o quadro cabe na tela", () => {
+    test.use({ viewport: { width: 820, height: 600 } });
+
+    test("a barra lateral fica no pé da tela e o nome da etapa não some ao rolar", async ({ page }) => {
+      await login(page, creds.users.manager!.email, creds.password);
+      await page.goto(`/app/pipelines/${pipelineId}`);
+      await expect(page.getByText(TITULO(1), { exact: true })).toBeVisible({ timeout: 30_000 });
+
+      const quadro = page.locator("[data-quadro-do-funil]");
+      const medida = await quadro.evaluate((el) => ({
+        pe: el.getBoundingClientRect().bottom,
+        janela: window.innerHeight,
+        rolaDeLado: el.scrollWidth > el.clientWidth,
+        rolaParaBaixo: el.scrollHeight > el.clientHeight,
+        paginaRola: document.documentElement.scrollHeight - document.documentElement.clientHeight,
+      }));
+      expect(medida.rolaDeLado, "fixture: em 820px as duas etapas não cabem lado a lado").toBe(true);
+      expect(medida.rolaParaBaixo, "fixture: a etapa de origem passa da altura do quadro").toBe(true);
+      expect(medida.pe, "o pé do quadro — onde mora a barra lateral — está dentro da tela").toBeLessThanOrEqual(
+        medida.janela,
+      );
+      expect(medida.paginaRola, "quem rola é o quadro, não a página").toBeLessThanOrEqual(2);
+
+      await quadro.evaluate((el) => {
+        el.scrollTop = el.scrollHeight;
+      });
+      const cabecalho = coluna(page, etapaOrigemId).locator("[data-cabecalho-da-etapa]");
+      // Quem entra aqui é manager: para ele o nome da etapa é o campo
+      // editável do cabeçalho (#1738), não um <h2>. É o nome que tem de
+      // ficar à vista, qualquer que seja o elemento que o carrega.
+      const nomeDaEtapa = cabecalho.getByTestId("nome-etapa-quadro");
+      await expect(nomeDaEtapa).toHaveValue("Origem");
+      await expect(nomeDaEtapa).toBeInViewport();
+      const topoDoCabecalho = (await cabecalho.boundingBox())!.y;
+      const topoDoQuadro = (await quadro.boundingBox())!.y;
+      expect(
+        Math.abs(topoDoCabecalho - topoDoQuadro),
+        "rolado até o fim, o cabeçalho continua preso no alto do quadro",
+      ).toBeLessThanOrEqual(2);
+      await captura(page, "08-quadro-cabe-na-tela");
+    });
+  });
+
+  /**
    * EXCLUIR UM CARD PELO MENU, NO TOQUE (issue #910).
    *
    * A afirmação-título do conserto é "aparece no toque", e ela não tem prova de
@@ -500,7 +557,7 @@ test.describe("Quadro do funil — agir em vários cards de uma vez", () => {
       // ⚠️ Nenhum `hover()` antes desta leitura: num aparelho de toque o ponteiro
       // nunca "passa por cima", e era com `opacity-0` incondicional que o menu
       // ficava inalcançável.
-      const botao = page.getByRole("button", { name: "Ações do lead" }).first();
+      const botao = page.getByRole("button", { name: "Ações do negócio" }).first();
       await expect(botao).toHaveCount(1);
       const opacidade = await botao.evaluate((el) => Number(getComputedStyle(el).opacity));
       expect(
